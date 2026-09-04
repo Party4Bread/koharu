@@ -3041,7 +3041,6 @@ impl HarnessHost {
             {
                 if changed_fields.contains(&"source_text")
                     && let Some(decision) = decisions.get_mut(element)
-                    && decision.is_translated()
                 {
                     let source = after
                         .source
@@ -12484,6 +12483,51 @@ mod tests {
         let acceptance = evaluate(&after);
         assert!(!acceptance.rejection_reasons.iter().any(|reason| {
             reason.element_id == Some(element_id)
+                && reason.code == AcceptanceRejectionCode::InvalidDecorativeSfxDecision
+        }));
+
+        let retained_semantic_correction = host
+            .revise_page_translation(&ToolCall {
+                call_id: "source-and-translation-retained-revision".to_owned(),
+                name: "revise_page_translation".to_owned(),
+                arguments: serde_json::to_string(&json!({
+                    "page_ordinal": 1,
+                    "evidence": revision_evidence(&host).await,
+                    "edits": [{
+                        "element": retained_element_id,
+                        "source": { "text": "えー", "language": "ja-JP" },
+                        "translation": { "text": "어~", "language": "ko-KR" }
+                    }],
+                    "page_rationale": "The authoritative source crop corrects the retained required dialogue OCR and its translation."
+                }))
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+        let retained_committed_revision = Revision::new(
+            retained_semantic_correction.value["revision_after"]
+                .as_u64()
+                .unwrap(),
+        );
+        let refreshed_retained_decision = host
+            .decorative_sfx_decisions
+            .lock()
+            .get(&retained_element_id)
+            .unwrap()
+            .clone();
+        assert_eq!(refreshed_retained_decision.source_ocr.text, "えー");
+        assert_eq!(
+            refreshed_retained_decision.source_ocr.language.as_deref(),
+            Some("ja-JP")
+        );
+        assert_eq!(
+            refreshed_retained_decision.decision_revision,
+            retained_committed_revision
+        );
+        let after = host.inspect_project().await.unwrap();
+        let acceptance = evaluate(&after);
+        assert!(!acceptance.rejection_reasons.iter().any(|reason| {
+            reason.element_id == Some(retained_element_id)
                 && reason.code == AcceptanceRejectionCode::InvalidDecorativeSfxDecision
         }));
     }
