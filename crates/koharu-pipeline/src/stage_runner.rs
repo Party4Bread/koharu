@@ -32,6 +32,10 @@ impl StageRunner {
         })
     }
 
+    pub(crate) fn target_language(&self) -> koharu_translator::Language {
+        self.stages.target_language()
+    }
+
     #[tracing::instrument(skip_all)]
     pub(crate) async fn run(&self, job: StageJob) -> StageCompletion {
         let started = Instant::now();
@@ -129,7 +133,7 @@ impl StageRunner {
             .await
             .map(|patch| {
                 if patch.is_empty() {
-                    StageOutcome::Skipped
+                    StageOutcome::NoOp
                 } else {
                     StageOutcome::Patch(patch)
                 }
@@ -189,6 +193,7 @@ impl StageJob {
 
 pub(crate) enum StageOutcome {
     Patch(Patch),
+    NoOp,
     Skipped,
     Stopped,
 }

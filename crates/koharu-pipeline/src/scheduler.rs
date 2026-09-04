@@ -35,7 +35,7 @@ impl PageWork {
     }
 
     fn ready(&self, index: usize) -> bool {
-        let Some(prerequisite) = prerequisite(self.stages[index].stage) else {
+        let Some(prerequisite) = prerequisite(&self.stages, self.stages[index].stage) else {
             return true;
         };
         self.stages
@@ -142,12 +142,22 @@ impl Scheduler {
     }
 }
 
-const fn prerequisite(stage: Stage) -> Option<Stage> {
+fn prerequisite(stages: &[StageWork], stage: Stage) -> Option<Stage> {
     match stage {
         Stage::Detection => None,
         Stage::Ocr | Stage::Inpainting => Some(Stage::Detection),
         Stage::Translation => Some(Stage::Ocr),
     }
+    .and_then(|prerequisite| {
+        if stage == Stage::Inpainting && stages.iter().any(|work| work.stage == Stage::Ocr) {
+            Some(Stage::Ocr)
+        } else {
+            stages
+                .iter()
+                .any(|work| work.stage == prerequisite)
+                .then_some(prerequisite)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -159,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn starts_pages_in_order_and_models_independently() {
+    fn full_pipeline_waits_for_ocr_preprocessing_before_inpainting() {
         let pages = pages(2);
         let mut scheduler = Scheduler::new(&pages, &Stage::ALL);
         let mut busy = BTreeSet::new();
@@ -173,20 +183,19 @@ mod tests {
         assert!(!scheduler.complete_stage(pages[0], Stage::Detection));
         let ocr = scheduler.start_next(&busy).unwrap();
         busy.insert(ocr.1);
-        let inpainting = scheduler.start_next(&busy).unwrap();
-        busy.insert(inpainting.1);
         let next_page = scheduler.start_next(&busy).unwrap();
         busy.insert(next_page.1);
         assert_eq!(ocr, (pages[0], Stage::Ocr));
-        assert_eq!(inpainting, (pages[0], Stage::Inpainting));
         assert_eq!(next_page, (pages[1], Stage::Detection));
 
         assert!(!scheduler.complete_stage(pages[0], Stage::Ocr));
         busy.remove(&Stage::Ocr);
         let translation = scheduler.start_next(&busy).unwrap();
+        busy.insert(translation.1);
+        let inpainting = scheduler.start_next(&busy).unwrap();
         assert_eq!(translation, (pages[0], Stage::Translation));
+        assert_eq!(inpainting, (pages[0], Stage::Inpainting));
         assert!(busy.contains(&Stage::Detection));
-        assert!(busy.contains(&Stage::Inpainting));
     }
 
     #[test]
@@ -203,8 +212,6 @@ mod tests {
         assert!(!scheduler.complete_stage(pages[0], Stage::Detection));
         let ocr = scheduler.start_next(&busy).unwrap();
         busy.insert(ocr.1);
-        let inpainting = scheduler.start_next(&busy).unwrap();
-        busy.insert(inpainting.1);
 
         for page in &pages[1..3] {
             assert_eq!(scheduler.start_next(&busy), Some((*page, Stage::Detection)));
@@ -213,8 +220,31 @@ mod tests {
         assert!(scheduler.start_next(&busy).is_none());
 
         assert!(!scheduler.complete_stage(pages[0], Stage::Ocr));
-        assert!(scheduler.complete_stage(pages[0], Stage::Inpainting));
         busy.clear();
-        assert_eq!(scheduler.start_next(&busy), Some((pages[1], Stage::Ocr)));
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[0], Stage::Inpainting))
+        );
+    }
+
+    #[test]
+    fn inpainting_without_ocr_still_waits_for_detection() {
+        let pages = pages(1);
+        let stages = [Stage::Detection, Stage::Inpainting];
+        let mut scheduler = Scheduler::new(&pages, &stages);
+        let mut busy = BTreeSet::new();
+
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[0], Stage::Detection))
+        );
+        busy.insert(Stage::Detection);
+        assert!(scheduler.start_next(&busy).is_none());
+        busy.clear();
+        assert!(!scheduler.complete_stage(pages[0], Stage::Detection));
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[0], Stage::Inpainting))
+        );
     }
 }

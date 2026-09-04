@@ -17,7 +17,7 @@ use crate::{
     scheduler::Scheduler,
     scope::NormalizedScope,
     stage_runner::{StageCompletion, StageJob, StageOutcome, StageRunner},
-    stages::StageInput,
+    stages::{StageInput, prepare_translation_inputs},
 };
 
 pub(crate) struct Execution<'a> {
@@ -36,6 +36,10 @@ pub(crate) struct Execution<'a> {
     base: koharu_scene::Revision,
     started: Instant,
     inpainting_mask: Option<crate::InpaintingMask>,
+    source_language: Option<koharu_translator::Language>,
+    translation_requested: bool,
+    ocr_requested: bool,
+    preprocessed_pages: BTreeSet<EntityId>,
 }
 
 impl<'a> Execution<'a> {
@@ -55,6 +59,8 @@ impl<'a> Execution<'a> {
         let scope = NormalizedScope::new(&snapshot, &request.scope, &stages)
             .map_err(|error| PipelineError::new(ErrorKind::InvalidInput, None, error))?;
         let pages = scope.pages().to_vec();
+        let translation_requested = stages.contains(&Stage::Translation);
+        let ocr_requested = stages.contains(&Stage::Ocr);
         if let Some(mask) = request.inpainting_mask.as_ref()
             && (!pages.contains(&mask.page) || !stages.contains(&Stage::Inpainting))
         {
@@ -88,12 +94,22 @@ impl<'a> Execution<'a> {
             base,
             started,
             inpainting_mask: request.inpainting_mask,
+            source_language: request.source_language,
+            translation_requested,
+            ocr_requested,
+            preprocessed_pages: BTreeSet::new(),
         })
     }
 
     pub(crate) async fn run(mut self) -> std::result::Result<Report, PipelineError> {
         if self.stopped() {
             return Ok(self.report(RunStatus::Stopped));
+        }
+
+        if self.translation_requested && !self.ocr_requested {
+            for page in self.scope.pages().to_vec() {
+                self.prepare_translation(page).await?;
+            }
         }
 
         self.resources.start();
@@ -140,6 +156,7 @@ impl<'a> Execution<'a> {
                 self.scope.entities(),
                 self.scope.region(page),
                 images,
+                self.source_language,
                 self.inpainting_mask
                     .as_ref()
                     .filter(|mask| stage == Stage::Inpainting && mask.page == page)
@@ -163,13 +180,56 @@ impl<'a> Execution<'a> {
         } = completion;
         match outcome? {
             StageOutcome::Stopped => {}
+            StageOutcome::NoOp => {
+                if stage == Stage::Ocr && self.translation_requested {
+                    self.prepare_translation(page).await?;
+                }
+                self.mark_complete(page, stage);
+                progress::emit(
+                    self.progress.as_ref(),
+                    Progress::NoOp {
+                        page,
+                        stage,
+                        model,
+                        elapsed,
+                    },
+                );
+            }
             StageOutcome::Skipped => {
+                if stage == Stage::Ocr && self.translation_requested {
+                    // OCR completion is also the preprocessing barrier. The scheduler
+                    // cannot establish translation or inpainting inputs until this
+                    // transaction has advanced the execution scene.
+                    self.prepare_translation(page).await?;
+                }
                 self.mark_complete(page, stage);
                 progress::emit(self.progress.as_ref(), Progress::Skipped { page, stage });
             }
             StageOutcome::Patch(patch) => {
-                if !self.commit_patch(page, stage, patch).await? {
-                    return Ok(());
+                match self.commit_patch(page, stage, patch).await? {
+                    CommitResult::Stopped => return Ok(()),
+                    CommitResult::NoOp => {
+                        if stage == Stage::Ocr && self.translation_requested {
+                            self.prepare_translation(page).await?;
+                        }
+                        self.mark_complete(page, stage);
+                        progress::emit(
+                            self.progress.as_ref(),
+                            Progress::NoOp {
+                                page,
+                                stage,
+                                model,
+                                elapsed,
+                            },
+                        );
+                        return Ok(());
+                    }
+                    CommitResult::Committed => {}
+                }
+                if stage == Stage::Ocr && self.translation_requested {
+                    // Keep preprocessing in the OCR transaction boundary so every
+                    // downstream stage takes its base from the adjusted scene.
+                    self.prepare_translation(page).await?;
                 }
                 self.mark_complete(page, stage);
                 progress::emit(
@@ -186,12 +246,34 @@ impl<'a> Execution<'a> {
         Ok(())
     }
 
+    async fn prepare_translation(
+        &mut self,
+        page: EntityId,
+    ) -> std::result::Result<(), PipelineError> {
+        if !self.preprocessed_pages.insert(page) {
+            return Ok(());
+        }
+        let (patch, report) =
+            prepare_translation_inputs(&self.scene, page, self.runner.target_language())
+                .context("failed to preprocess source regions before translation")
+                .map_err(|error| {
+                    PipelineError::new(ErrorKind::InvalidOutput, Some(Stage::Translation), error)
+                })?;
+        if report.adjusted()
+            && self.commit_patch(page, Stage::Translation, patch).await? == CommitResult::Stopped
+        {
+            return Ok(());
+        }
+        progress::emit(self.progress.as_ref(), Progress::Preprocessed { report });
+        Ok(())
+    }
+
     async fn commit_patch(
         &mut self,
         page: EntityId,
         stage: Stage,
         patch: koharu_scene::Patch,
-    ) -> std::result::Result<bool, PipelineError> {
+    ) -> std::result::Result<CommitResult, PipelineError> {
         let patch = patch
             .rebase_on(&self.scene)
             .and_then(|patch| {
@@ -200,8 +282,11 @@ impl<'a> Execution<'a> {
             })
             .context("failed to rebase stage output onto the latest scene")
             .map_err(|error| PipelineError::new(ErrorKind::InvalidOutput, Some(stage), error))?;
+        if patch.is_empty() {
+            return Ok(CommitResult::NoOp);
+        }
         if self.stopped() {
-            return Ok(false);
+            return Ok(CommitResult::Stopped);
         }
 
         let next = self
@@ -213,7 +298,7 @@ impl<'a> Execution<'a> {
         validate_commit(&self.scene, &next)
             .map_err(|error| PipelineError::new(ErrorKind::Commit, Some(stage), error))?;
         self.scene = next;
-        Ok(true)
+        Ok(CommitResult::Committed)
     }
 
     fn mark_complete(&mut self, page: EntityId, stage: Stage) {
@@ -262,7 +347,14 @@ impl<'a> Execution<'a> {
     }
 }
 
-fn validate_commit(previous: &Snapshot, next: &Snapshot) -> Result<()> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CommitResult {
+    Committed,
+    NoOp,
+    Stopped,
+}
+
+pub(crate) fn validate_commit(previous: &Snapshot, next: &Snapshot) -> Result<()> {
     ensure!(
         previous.project_id() == next.project_id(),
         "committer returned a snapshot from another project"

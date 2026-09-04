@@ -13,6 +13,83 @@ use crate::{
 use super::{Authored, Origin};
 
 #[revisioned(revision = 1)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type)]
+pub struct LogicalDialogueMember {
+    pub ordinal: u32,
+    pub element_id: crate::EntityId,
+    pub content_id: crate::EntityId,
+    pub source_region_id: crate::EntityId,
+}
+
+/// Owns one rendered dialogue paragraph while retaining every source OCR member.
+///
+/// This component lives on `members[0].content_id`. The first member is the
+/// primary presentation layer; later members remain source-evidence entities
+/// and must not independently own a visible translation.
+#[revisioned(revision = 1)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+pub struct LogicalDialogue {
+    pub origin: Origin,
+    pub target_region_id: crate::EntityId,
+    pub members: Vec<LogicalDialogueMember>,
+}
+
+impl Component for LogicalDialogue {
+    const KIND: &'static str = "dev.koharu.text.logical-dialogue";
+
+    fn record_refs(&self) -> Vec<crate::EntityId> {
+        let mut references = vec![self.target_region_id];
+        for member in &self.members {
+            references.extend([
+                member.element_id,
+                member.content_id,
+                member.source_region_id,
+            ]);
+        }
+        references
+    }
+
+    fn validate(&self, context: &ValidationContext<'_>) -> Result<()> {
+        self.origin.validate()?;
+        if self.members.len() < 2 || self.members.len() > 1_000_000 {
+            return Err(Error::invalid(
+                "logical dialogue must contain at least two members",
+            ));
+        }
+        let mut elements = std::collections::BTreeSet::new();
+        let mut contents = std::collections::BTreeSet::new();
+        let mut regions = std::collections::BTreeSet::new();
+        for (index, member) in self.members.iter().enumerate() {
+            if member.ordinal != index as u32 + 1
+                || !elements.insert(member.element_id)
+                || !contents.insert(member.content_id)
+                || !regions.insert(member.source_region_id)
+                || !context.contains_entity(member.element_id)
+                || !context.contains_entity(member.content_id)
+                || !context.contains_entity(member.source_region_id)
+            {
+                return Err(Error::invalid(
+                    "logical dialogue members must be ordered, unique, and present",
+                ));
+            }
+        }
+        if !context.contains_entity(self.target_region_id) {
+            return Err(Error::invalid("logical dialogue target region is missing"));
+        }
+        Ok(())
+    }
+
+    fn origin(&self) -> Option<&Origin> {
+        Some(&self.origin)
+    }
+
+    fn set_origin(&mut self, origin: Origin) -> bool {
+        self.origin = origin;
+        true
+    }
+}
+
+#[revisioned(revision = 1)]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Type)]
 #[serde(transparent)]
 pub struct LanguageTag(String);

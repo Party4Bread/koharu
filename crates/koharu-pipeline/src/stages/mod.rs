@@ -1,9 +1,13 @@
 mod detection;
 mod inpainting;
 mod ocr;
+mod preprocessing;
 mod translation;
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -11,8 +15,34 @@ use koharu_scene::{Edit, EntityId, Generation, Patch, ProducerId, Snapshot};
 
 pub use detection::KoharuLayoutRFDetrSeg2XLConfig;
 pub use inpainting::{Flux2KleinConfig, RoremMixedConfig};
+pub use preprocessing::{
+    LogicalDialogueGroup, LogicalDialogueGroupMember, PreprocessingReport, SourceRegionMerge,
+    TypesettingAdjustment, prepare_translation_inputs,
+};
 
 use crate::{Bounds, ImageCache, InpaintingMask, PipelineConfig, Stage};
+
+type PaddleOcrModel = Arc<Mutex<koharu_ml::paddle_ocr_vl_quantized::PaddleOCRVLQuantized>>;
+type SharedPaddleOcrModel = Arc<crate::ModelCell<PaddleOcrModel>>;
+
+async fn paddle_ocr_model(
+    shared: &SharedPaddleOcrModel,
+    device: koharu_ml::Device,
+) -> Result<PaddleOcrModel> {
+    shared
+        .ensure(|| async move {
+            Ok(Arc::new(Mutex::new(
+                koharu_ml::paddle_ocr_vl_quantized::PaddleOCRVLQuantized::load(device).await?,
+            )))
+        })
+        .await?;
+    shared
+        .lock()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("PaddleOCR-VL model was not retained after loading"))
+}
 
 #[derive(Clone)]
 pub(crate) struct StageInput {
@@ -21,6 +51,7 @@ pub(crate) struct StageInput {
     entities: Option<Arc<BTreeSet<EntityId>>>,
     region: Option<Bounds>,
     images: Arc<ImageCache>,
+    source_language: Option<koharu_translator::Language>,
     inpainting_mask: Option<InpaintingMask>,
 }
 
@@ -31,6 +62,7 @@ impl StageInput {
         entities: Option<Arc<BTreeSet<EntityId>>>,
         region: Option<Bounds>,
         images: Arc<ImageCache>,
+        source_language: Option<koharu_translator::Language>,
         inpainting_mask: Option<InpaintingMask>,
     ) -> Self {
         Self {
@@ -39,12 +71,17 @@ impl StageInput {
             entities,
             region,
             images,
+            source_language,
             inpainting_mask,
         }
     }
 
     pub(crate) fn page(&self) -> EntityId {
         self.page
+    }
+
+    pub(crate) fn source_language(&self) -> Option<koharu_translator::Language> {
+        self.source_language
     }
 
     fn contains_entity(&self, entity: EntityId) -> Result<bool> {
@@ -82,9 +119,14 @@ impl Stages {
         translator: koharu_translator::Translator,
         device: &koharu_ml::Device,
     ) -> Result<Self> {
+        let paddle_ocr = Arc::new(crate::ModelCell::new());
         Ok(Self {
-            detection: detection::Processor::new(config.detection()?, device.clone()),
-            ocr: ocr::Processor::new(config.ocr.clone(), device.clone()),
+            detection: detection::Processor::new(
+                config.detection()?,
+                device.clone(),
+                paddle_ocr.clone(),
+            ),
+            ocr: ocr::Processor::new(config.ocr.clone(), device.clone(), paddle_ocr),
             translation: translation::Processor::new(config.translation.clone(), translator),
             inpainting: inpainting::Processor::new(config.inpainting()?, device.clone())?,
         })
@@ -101,6 +143,10 @@ impl Stages {
 
     pub(crate) fn model(&self, stage: Stage) -> &'static str {
         self.processor(stage).model()
+    }
+
+    pub(crate) fn target_language(&self) -> koharu_translator::Language {
+        self.translation.target_language()
     }
 
     pub(crate) fn skip(&self, stage: Stage, input: &StageInput) -> Result<bool> {

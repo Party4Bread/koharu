@@ -33,6 +33,7 @@ interface ConversationMessage {
   role: 'user' | 'assistant'
   text: string
   error?: boolean
+  trace?: string
 }
 
 export function AgentPanel() {
@@ -178,7 +179,12 @@ export function AgentPanel() {
                   data-error={message.error || undefined}
                   className='max-w-[90%] rounded-xl bg-muted px-3 py-2 text-[11px] leading-5 whitespace-pre-wrap select-text data-[error=true]:bg-destructive/10 data-[error=true]:text-destructive data-[role=user]:bg-primary data-[role=user]:text-primary-foreground'
                 >
-                  {message.text || (message.role === 'assistant' ? t('agent.working') : '')}
+                  <p>{message.text || (message.role === 'assistant' ? t('agent.working') : '')}</p>
+                  {message.trace ? (
+                    <p className='mt-1 font-mono text-[9px] break-all opacity-70'>
+                      {message.trace}
+                    </p>
+                  ) : null}
                 </div>
               </div>
             ))}
@@ -294,6 +300,11 @@ export function AgentPanel() {
       switch (event.type) {
         case 'started':
           setRunning(event.run)
+          setMessages((current) =>
+            current.map((item) =>
+              item.id === assistant ? { ...item, trace: event.trace.path } : item,
+            ),
+          )
           break
         case 'text_delta':
           updateAssistant((text) => text + event.delta)

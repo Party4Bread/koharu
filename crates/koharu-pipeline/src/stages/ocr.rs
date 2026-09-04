@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 
-use super::{StageInput, StageProcessor, finish, generation};
+use super::{
+    SharedPaddleOcrModel, StageInput, StageProcessor, finish, generation, paddle_ocr_model,
+};
 use crate::{ModelCell, OcrModel, scope::geometry_extents};
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -19,14 +21,20 @@ const PRODUCER: &str = "dev.koharu.pipeline.ocr";
 pub(super) struct Processor {
     config: OcrModel,
     device: koharu_ml::Device,
+    paddle_ocr: SharedPaddleOcrModel,
     model: ModelCell<Model>,
 }
 
 impl Processor {
-    pub(super) fn new(config: OcrModel, device: koharu_ml::Device) -> Self {
+    pub(super) fn new(
+        config: OcrModel,
+        device: koharu_ml::Device,
+        paddle_ocr: SharedPaddleOcrModel,
+    ) -> Self {
         Self {
             config,
             device,
+            paddle_ocr,
             model: ModelCell::new(),
         }
     }
@@ -44,12 +52,12 @@ impl StageProcessor for Processor {
     }
 
     fn unload(&self) -> bool {
-        self.model.unload()
+        self.model.unload() | self.paddle_ocr.unload()
     }
 
     async fn load(&self) -> Result<()> {
         self.model
-            .ensure(|| Model::load(self.device.clone(), &self.config))
+            .ensure(|| Model::load(self.device.clone(), &self.config, self.paddle_ocr.clone()))
             .await
     }
 
@@ -72,7 +80,11 @@ enum Model {
 }
 
 impl Model {
-    async fn load(device: koharu_ml::Device, config: &OcrModel) -> Result<Self> {
+    async fn load(
+        device: koharu_ml::Device,
+        config: &OcrModel,
+        paddle_ocr: SharedPaddleOcrModel,
+    ) -> Result<Self> {
         match config {
             OcrModel::MangaOcr => Ok(Self::Manga(Arc::new(Mutex::new(
                 MangaOcr::load(device).await?,
@@ -83,21 +95,24 @@ impl Model {
             OcrModel::HayaiOcr => Ok(Self::Hayai(Arc::new(Mutex::new(
                 HayaiOcr::load(device).await?,
             )))),
-            OcrModel::PaddleOcrVl1_6 => Ok(Self::Paddle(Arc::new(Mutex::new(
-                PaddleOCRVLQuantized::load(device).await?,
-            )))),
+            OcrModel::PaddleOcrVl1_6 => {
+                Ok(Self::Paddle(paddle_ocr_model(&paddle_ocr, device).await?))
+            }
         }
     }
 
     async fn run(&self, input: StageInput) -> Result<koharu_scene::Patch> {
+        let requested_language = input.source_language();
         let model_name = match self {
             Self::Manga(_) => "manga-ocr",
             Self::Baberu(_) => "baberu-ocr",
             Self::Hayai(_) => "hayai-ocr",
             Self::Paddle(_) => "paddleocr-vl-1.6",
         };
+        let generation = generation(PRODUCER, model_name)?;
         let page = input.page;
         let mut targets = Vec::new();
+        let mut preserved = Vec::new();
         let source = input
             .images
             .get(&input.scene, page, "source")
@@ -130,6 +145,22 @@ impl Model {
                 {
                     continue;
                 }
+                if previous.as_ref().is_some_and(|value| {
+                    !value.text.value.is_empty()
+                        && matches!(
+                            &value.text.origin,
+                            Origin::Generated(owner) if owner.producer != generation.producer
+                        )
+                }) {
+                    preserved.push(OcrResult {
+                        content,
+                        region,
+                        geometry: geometry.clone(),
+                        previous,
+                        text: None,
+                    });
+                    continue;
+                }
                 targets.push(OcrTarget {
                     content,
                     region,
@@ -139,8 +170,7 @@ impl Model {
                 });
             }
         }
-
-        let results = match self {
+        let mut results = match self {
             Self::Manga(model) => {
                 infer_text(model.clone(), targets, |model, image| {
                     model.inference(image)
@@ -167,26 +197,30 @@ impl Model {
             }
         };
 
-        let generation = generation(PRODUCER, model_name)?;
+        results.extend(preserved);
         let mut edit = input.scene.edit_as(generation.clone());
         edit.observe_assets(page)?;
         for result in &results {
             edit.observe::<Region>(result.region)?;
             edit.observe::<Geometry>(result.region)?;
-            edit.observe::<SourceText>(result.content)?;
+            if result.text.is_some() {
+                edit.observe::<SourceText>(result.content)?;
+            }
         }
         for result in results {
-            let language = result
-                .previous
-                .and_then(|value| value.language)
-                .or_else(|| LanguageTag::new("ja-JP").ok());
-            edit.set(
-                result.content,
-                &SourceText {
-                    text: Authored::generated(result.text, generation.clone()),
-                    language,
-                },
-            )?;
+            if let Some(text) = result.text {
+                let language = resolved_source_language(
+                    requested_language,
+                    result.previous.and_then(|value| value.language),
+                )?;
+                edit.set(
+                    result.content,
+                    &SourceText {
+                        text: Authored::generated(text, generation.clone()),
+                        language,
+                    },
+                )?;
+            }
             let (min_x, min_y, max_x, max_y) = geometry_extents(&result.geometry)
                 .ok_or_else(|| anyhow!("text region {} has empty geometry", result.region))?;
             edit.set(
@@ -207,6 +241,17 @@ impl Model {
     }
 }
 
+fn resolved_source_language(
+    requested: Option<koharu_translator::Language>,
+    previous: Option<LanguageTag>,
+) -> Result<Option<LanguageTag>> {
+    Ok(requested
+        .map(|language| LanguageTag::new(language.tag()))
+        .transpose()?
+        .or(previous)
+        .or_else(|| LanguageTag::new("ja-JP").ok()))
+}
+
 struct OcrTarget {
     content: EntityId,
     region: EntityId,
@@ -220,7 +265,7 @@ struct OcrResult {
     region: EntityId,
     geometry: Geometry,
     previous: Option<SourceText>,
-    text: String,
+    text: Option<String>,
 }
 
 async fn infer_text<M: Send + 'static>(
@@ -240,7 +285,7 @@ async fn infer_text<M: Send + 'static>(
                     region: target.region,
                     geometry: target.geometry,
                     previous: target.previous,
-                    text: normalize_ocr_text(inference(&model, &target.image)?),
+                    text: Some(normalize_ocr_text(inference(&model, &target.image)?)),
                 })
             })
             .collect()
@@ -282,7 +327,21 @@ fn crop(source: &DynamicImage, geometry: &Geometry) -> Result<DynamicImage> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_ocr_text;
+    use koharu_scene::LanguageTag;
+    use koharu_translator::Language;
+
+    use super::{normalize_ocr_text, resolved_source_language};
+
+    #[test]
+    fn requested_source_language_overrides_ocr_default_and_previous_tag() {
+        let language = resolved_source_language(
+            Some(Language::English),
+            Some(LanguageTag::new("ja-JP").unwrap()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(language.to_string(), Language::English.tag());
+    }
 
     #[test]
     fn repeated_placeholder_glyphs_are_an_ellipsis() {

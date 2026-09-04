@@ -42,6 +42,8 @@ The file contains owned sections for the pipeline, translation providers, typese
 
 Provider credentials use the operating system's secure credential service. They are intentionally separate from `config.toml` and project files. Backing up a project does not back up provider keys or the Koharu Agent account session.
 
+On Linux, Koharu stores credentials in the desktop Secret Service default/login collection, as provided by GNOME Keyring or KWallet's Secret Service interface. These credentials persist across logout, restart, and power loss until they are deleted. Koharu does not fall back to plaintext files or the reboot-volatile kernel keyring. If Secret Service is unavailable or its collection cannot be unlocked, Koharu reports that condition instead of storing the credential elsewhere.
+
 ## Runtime and model cache
 
 Native runtime packages and model files live below the operating system cache directory:

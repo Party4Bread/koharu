@@ -57,6 +57,8 @@ pub(crate) struct RenderedTextMetadata {
     pub(crate) layout_bounds: RenderBounds,
     pub(crate) post_script_fonts: Vec<String>,
     pub(crate) font_size: f32,
+    pub(crate) line_count: usize,
+    pub(crate) rendered_lines: Vec<String>,
     pub(crate) color: [u8; 4],
 }
 
@@ -240,6 +242,12 @@ impl TextRenderer {
         }
         if is_bubble_text && descriptor.writing_mode == WritingMode::Horizontal {
             layout = layout.with_hyphenation_policy(HyphenationPolicy::LastResort);
+            layout = layout.with_korean_word_balance(
+                descriptor
+                    .language
+                    .as_ref()
+                    .is_some_and(|language| is_korean_language(language.as_str())),
+            );
         }
         let layout = if descriptor.auto_fit && !descriptor.point_text {
             layout
@@ -328,6 +336,13 @@ impl TextRenderer {
                     .map(|font| font.post_script_name().to_owned())
                     .collect(),
                 font_size: layout.font_size,
+                line_count: layout.lines.len(),
+                rendered_lines: layout
+                    .lines
+                    .iter()
+                    .filter_map(|line| descriptor.text.get(line.range.clone()))
+                    .map(|line| line.trim().to_owned())
+                    .collect(),
                 color,
             },
             diagnostics,
@@ -340,7 +355,9 @@ fn automatic_maximum(
     bounds: LayoutBox,
     is_bubble_text: bool,
 ) -> f32 {
-    if is_bubble_text {
+    if let Some(size) = descriptor.font_size {
+        size
+    } else if is_bubble_text || !descriptor.point_text {
         if descriptor.writing_mode.is_vertical() {
             bounds.height
         } else {
@@ -356,6 +373,13 @@ fn is_chinese_or_japanese_language(language: &str) -> bool {
         .split(['-', '_'])
         .next()
         .is_some_and(|primary| matches!(primary.to_ascii_lowercase().as_str(), "ja" | "zh"))
+}
+
+fn is_korean_language(language: &str) -> bool {
+    language
+        .split(['-', '_'])
+        .next()
+        .is_some_and(|primary| primary.eq_ignore_ascii_case("ko"))
 }
 
 fn inset(rect: LayoutBox, [top, right, bottom, left]: [f32; 4]) -> LayoutBox {
@@ -494,8 +518,14 @@ mod tests {
             height: 120.0,
         };
 
-        assert_eq!(automatic_maximum(&descriptor, bounds, false), 24.0);
-        assert_eq!(automatic_maximum(&descriptor, bounds, true), 240.0);
+        assert_eq!(automatic_maximum(&descriptor, bounds, false), 6.0);
+        assert_eq!(automatic_maximum(&descriptor, bounds, true), 6.0);
+
+        let mut adaptive = descriptor.clone();
+        adaptive.font_size = None;
+        assert_eq!(automatic_maximum(&adaptive, bounds, false), 240.0);
+        adaptive.point_text = true;
+        assert_eq!(automatic_maximum(&adaptive, bounds, false), 24.0);
     }
 
     #[test]

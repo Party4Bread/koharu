@@ -1,14 +1,22 @@
 'use client'
 
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { TitleBar } from '@/components/app/TitleBar'
+import { AgentPanel } from '@/components/editor/AgentPanel'
 import { Editor } from '@/components/editor/Editor'
 import { SettingsPage } from '@/components/preferences/SettingsPage'
 import { StartView } from '@/components/start/StartView'
 import { useProject } from '@/lib/queries'
 import { useKoharuStore } from '@/lib/store'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@koharu/ui/components/dialog'
 import { cn } from '@koharu/ui/lib/utils'
 
 export function KoharuApp() {
@@ -19,6 +27,7 @@ export function KoharuApp() {
   const selectLayers = useKoharuStore((state) => state.selectLayers)
   const projectLoaded = project !== undefined
   const settingsOpen = useKoharuStore((state) => state.settingsOpen)
+  const [startAgentOpen, setStartAgentOpen] = useState(false)
   const activePage = project?.active_page
   const editorOpen = project !== undefined && project !== null && !settingsOpen
 
@@ -46,10 +55,19 @@ export function KoharuApp() {
           </div>
         </main>
       ) : project === null ? (
-        <StartView />
+        <StartView onOpenAgent={() => setStartAgentOpen(true)} />
       ) : (
         <Editor />
       )}
+      <Dialog open={startAgentOpen} onOpenChange={setStartAgentOpen}>
+        <DialogContent className='grid h-[min(720px,calc(100vh-4rem))] grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden p-0 sm:max-w-md'>
+          <DialogHeader className='sr-only'>
+            <DialogTitle>{t('agent.title')}</DialogTitle>
+            <DialogDescription>{t('agent.emptyDescription')}</DialogDescription>
+          </DialogHeader>
+          <AgentPanel />
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

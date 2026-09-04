@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::collections::BTreeSet;
+
+use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use koharu_scene::{Authored, LanguageTag, Origin, SourceText, Translation};
 use koharu_translator::{TranslationRequest, Translator};
@@ -8,6 +10,7 @@ use crate::TranslationConfig;
 use super::{StageInput, StageProcessor, finish, generation};
 
 const PRODUCER: &str = "dev.koharu.pipeline.translation";
+const SKIPPED_DIFFICULT_SFX_ROLE: &str = "dev.koharu.text.skipped-difficult-sfx";
 
 pub(super) struct Processor {
     config: TranslationConfig,
@@ -17,6 +20,10 @@ pub(super) struct Processor {
 impl Processor {
     pub(super) fn new(config: TranslationConfig, translator: Translator) -> Self {
         Self { config, translator }
+    }
+
+    pub(super) fn target_language(&self) -> koharu_translator::Language {
+        self.config.target_language
     }
 }
 
@@ -37,11 +44,56 @@ impl StageProcessor for Processor {
     async fn process(&self, input: StageInput) -> Result<koharu_scene::Patch> {
         let mut targets = Vec::new();
         if let Some(group) = input.scene.page(input.page)?.text_group()? {
-            for layer in group.text_layers()? {
+            let layers = group.text_layers()?.collect::<Vec<_>>();
+            let logical_dialogues = layers
+                .iter()
+                .filter_map(|layer| {
+                    let content = layer.content().ok()?;
+                    content
+                        .logical_dialogue()
+                        .ok()?
+                        .map(|dialogue| (content.id(), dialogue))
+                })
+                .collect::<Vec<_>>();
+            let grouped_contents = logical_dialogues
+                .iter()
+                .flat_map(|(_, dialogue)| dialogue.members.iter().map(|member| member.content_id))
+                .collect::<BTreeSet<_>>();
+            for layer in layers {
                 if !input.contains_entity(layer.id())? {
                     continue;
                 }
                 let content = layer.content()?;
+                if content
+                    .role()?
+                    .is_some_and(|role| role.role == SKIPPED_DIFFICULT_SFX_ROLE)
+                {
+                    continue;
+                }
+                if let Some((_, dialogue)) = logical_dialogues
+                    .iter()
+                    .find(|(primary_content, _)| *primary_content == content.id())
+                {
+                    let source = dialogue
+                        .members
+                        .iter()
+                        .map(|member| {
+                            input
+                                .scene
+                                .component::<SourceText>(member.content_id)?
+                                .context("logical dialogue member is missing source text")
+                                .map(|source| source.text.value)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .join("\n");
+                    if !source.trim().is_empty() {
+                        targets.push((content.id(), source));
+                    }
+                    continue;
+                }
+                if grouped_contents.contains(&content.id()) {
+                    continue;
+                }
                 let Some(source) = content.source()? else {
                     continue;
                 };
@@ -50,9 +102,10 @@ impl StageProcessor for Processor {
                 }
             }
         }
-        let mut request = TranslationRequest::new(
+        let mut request = translation_request(
             targets.iter().map(|(_, source)| source.clone()),
             self.config.target_language,
+            input.source_language(),
         );
         if let Some(instructions) = self.config.instructions.as_deref() {
             request = request.with_instructions(instructions);
@@ -95,5 +148,35 @@ impl StageProcessor for Processor {
             )?;
         }
         finish(edit)
+    }
+}
+
+fn translation_request(
+    segments: impl IntoIterator<Item = String>,
+    target_language: koharu_translator::Language,
+    source_language: Option<koharu_translator::Language>,
+) -> TranslationRequest {
+    let request = TranslationRequest::new(segments, target_language);
+    match source_language {
+        Some(language) => request.with_source_language(language),
+        None => request,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use koharu_translator::Language;
+
+    use super::translation_request;
+
+    #[test]
+    fn requested_source_language_is_forwarded_to_translation_provider() {
+        let request = translation_request(
+            ["hello".to_owned()],
+            Language::Korean,
+            Some(Language::English),
+        );
+        assert_eq!(request.source_language, Some(Language::English));
+        assert_eq!(request.target_language, Language::Korean);
     }
 }

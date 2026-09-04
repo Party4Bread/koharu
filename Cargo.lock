@@ -4744,6 +4744,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.23.1",
+ "blake3",
  "eventsource-stream",
  "futures",
  "koharu-config",
@@ -4753,9 +4754,38 @@ dependencies = [
  "serde",
  "serde_json",
  "specta",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "koharu-agent-e2e"
+version = "0.80.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.23.1",
+ "blake3",
+ "clap",
+ "image",
+ "koharu-agent",
+ "koharu-config",
+ "koharu-desktop",
+ "koharu-ml",
+ "koharu-pipeline",
+ "koharu-rasterizer",
+ "koharu-renderer",
+ "koharu-scene",
+ "koharu-translator",
+ "parking_lot",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -4766,6 +4796,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.23.1",
+ "blake3",
  "dirs",
  "futures",
  "hayro",
@@ -4856,6 +4887,9 @@ name = "koharu-desktop"
 version = "0.81.5"
 dependencies = [
  "anyhow",
+ "futures",
+ "image",
+ "koharu-psd",
  "koharu-rasterizer",
  "koharu-renderer",
  "koharu-scene",
@@ -4864,6 +4898,7 @@ dependencies = [
  "specta",
  "tokio",
  "tracing",
+ "webp",
 ]
 
 [[package]]
@@ -5112,11 +5147,12 @@ name = "koharu-secrets"
 version = "0.81.5"
 dependencies = [
  "anyhow",
- "keyring",
+ "apple-native-keyring-store",
  "keyring-core",
- "linux-keyutils-keyring-store",
  "secrecy",
  "serde",
+ "windows-native-keyring-store",
+ "zbus-secret-service-keyring-store",
 ]
 
 [[package]]
@@ -5370,26 +5406,6 @@ name = "linktime-proc-macro"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e57c38c1e860fd37c604281cdfb1dd2216977fd76a50f85ba2f388ef3219616"
-
-[[package]]
-name = "linux-keyutils"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83270a18e9f90d0707c41e9f35efada77b64c0e6f3f1810e71c8368a864d5590"
-dependencies = [
- "bitflags 2.13.1",
- "libc",
-]
-
-[[package]]
-name = "linux-keyutils-keyring-store"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39fbed79f71dc21eb21d3d07c0e908a3c58ff9a1fdbf5cf44230fb3deb6d994b"
-dependencies = [
- "keyring-core",
- "linux-keyutils",
-]
 
 [[package]]
 name = "linux-raw-sys"

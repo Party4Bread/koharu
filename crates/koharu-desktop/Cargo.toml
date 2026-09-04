@@ -12,6 +12,9 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+futures = { workspace = true }
+image = { workspace = true }
+koharu-psd = { workspace = true }
 koharu-rasterizer = { workspace = true, features = ["native"] }
 koharu-renderer = { workspace = true }
 koharu-scene = { workspace = true }
@@ -20,3 +23,4 @@ serde = { workspace = true }
 specta = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+webp = { workspace = true }

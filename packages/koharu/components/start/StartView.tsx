@@ -1,6 +1,6 @@
 'use client'
 
-import { Folder, FolderPlus, Plus, Settings, Trash2 } from 'lucide-react'
+import { Bot, Folder, FolderPlus, Plus, Settings, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -24,7 +24,7 @@ import { Input } from '@koharu/ui/components/input'
 import { ScrollArea } from '@koharu/ui/components/scroll-area'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@koharu/ui/components/tooltip'
 
-export function StartView() {
+export function StartView({ onOpenAgent }: { onOpenAgent?: () => void }) {
   const { t } = useTranslation()
   const setSettingsOpen = useKoharuStore((state) => state.setSettingsOpen)
   const [projects, setProjects] = useState<ProjectSummary[]>([])
@@ -105,23 +105,44 @@ export function StartView() {
                   {t('start.description')}
                 </p>
               </div>
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Button
-                      type='button'
-                      variant='ghost'
-                      size='icon-sm'
-                      className='size-8 shrink-0 text-muted-foreground hover:bg-foreground/[0.05] hover:text-foreground'
-                      aria-label={t('menu.settings')}
-                      onClick={() => setSettingsOpen(true)}
-                    />
-                  }
-                >
-                  <Settings className='size-4' />
-                </TooltipTrigger>
-                <TooltipContent side='bottom'>{t('menu.settings')}</TooltipContent>
-              </Tooltip>
+              <div className='flex items-center gap-1'>
+                {onOpenAgent ? (
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <Button
+                          type='button'
+                          variant='ghost'
+                          size='icon-sm'
+                          className='size-8 shrink-0 text-muted-foreground hover:bg-foreground/[0.05] hover:text-foreground'
+                          aria-label={t('agent.title')}
+                          onClick={onOpenAgent}
+                        />
+                      }
+                    >
+                      <Bot className='size-4' />
+                    </TooltipTrigger>
+                    <TooltipContent side='bottom'>{t('agent.title')}</TooltipContent>
+                  </Tooltip>
+                ) : null}
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        type='button'
+                        variant='ghost'
+                        size='icon-sm'
+                        className='size-8 shrink-0 text-muted-foreground hover:bg-foreground/[0.05] hover:text-foreground'
+                        aria-label={t('menu.settings')}
+                        onClick={() => setSettingsOpen(true)}
+                      />
+                    }
+                  >
+                    <Settings className='size-4' />
+                  </TooltipTrigger>
+                  <TooltipContent side='bottom'>{t('menu.settings')}</TooltipContent>
+                </Tooltip>
+              </div>
             </header>
 
             <div className='mt-7 grid min-h-[390px] overflow-hidden rounded-2xl border border-border/80 bg-[var(--surface-panel)] md:grid-cols-[300px_minmax(0,1fr)]'>

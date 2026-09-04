@@ -21,6 +21,7 @@ use koharu_ml::koharu_layout_rfdetr_seg_2xl::{
     KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask, KoharuLayoutRFDetrSeg2XL,
     KoharuLayoutThresholds,
 };
+use koharu_ml::paddle_ocr_vl::PaddleOCRVLTask;
 use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, BubbleRegion, DetectionAnalysis, DetectionLabel,
     EntityId, EntityOrigin, FitsTo, FlowsIn, Generation, Geometry, Inside, Origin, PanelRegion,
@@ -31,12 +32,17 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use super::{StageInput, StageProcessor, finish, generation};
+use super::{
+    PaddleOcrModel, SharedPaddleOcrModel, StageInput, StageProcessor, finish, generation,
+    paddle_ocr_model,
+};
 use crate::{DetectionModel, ModelCell};
 
-const MODEL_ID: &str = "mayocream/koharu-layout-rfdetr-seg-2xl-1152";
+const MODEL_ID: &str =
+    "mayocream/koharu-layout-rfdetr-seg-2xl-1152 + PaddlePaddle/PaddleOCR-VL-1.6-GGUF:Spotting";
 const MODEL_NAME: &str = "koharu-layout-rfdetr-seg-2xl";
-const PRODUCER: &str = "dev.koharu.pipeline.detection";
+pub(super) const PRODUCER: &str = "dev.koharu.pipeline.detection";
+const LOC_SCALE: f64 = 1000.0;
 const ANGLE_SNAP_DEGREES: f32 = 3.0;
 const ANGLE_SEARCH_HALF_STEPS: i32 = 90;
 const ANGLE_SEARCH_STEP_DEGREES: f64 = 0.5;
@@ -48,6 +54,7 @@ const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
+const SOURCE_COVERAGE_REGION_KIND: &str = "dev.koharu.region.source-coverage-evidence";
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default)]
@@ -60,11 +67,16 @@ pub struct KoharuLayoutRFDetrSeg2XLConfig {
 pub(super) struct Processor {
     config: DetectionModel,
     device: koharu_ml::Device,
+    paddle_ocr: SharedPaddleOcrModel,
     model: ModelCell<Model>,
 }
 
 impl Processor {
-    pub(super) fn new(mut config: DetectionModel, device: koharu_ml::Device) -> Self {
+    pub(super) fn new(
+        mut config: DetectionModel,
+        device: koharu_ml::Device,
+        paddle_ocr: SharedPaddleOcrModel,
+    ) -> Self {
         let DetectionModel::KoharuLayoutRFDetrSeg2XL(settings) = &mut config;
         for (name, value) in [
             ("text", &mut settings.text_threshold),
@@ -88,6 +100,7 @@ impl Processor {
         Self {
             config,
             device,
+            paddle_ocr,
             model: ModelCell::new(),
         }
     }
@@ -114,12 +127,12 @@ impl StageProcessor for Processor {
     }
 
     fn unload(&self) -> bool {
-        self.model.unload()
+        self.model.unload() | self.paddle_ocr.unload()
     }
 
     async fn load(&self) -> Result<()> {
         self.model
-            .ensure(|| Model::load(self.device.clone(), &self.config))
+            .ensure(|| Model::load(self.device.clone(), &self.config, self.paddle_ocr.clone()))
             .await
     }
 
@@ -136,19 +149,26 @@ impl StageProcessor for Processor {
 
 struct Model {
     network: Arc<Mutex<KoharuLayoutRFDetrSeg2XL>>,
+    spotter: PaddleOcrModel,
     thresholds: KoharuLayoutThresholds,
 }
 
 impl Model {
-    async fn load(device: koharu_ml::Device, config: &DetectionModel) -> Result<Self> {
+    async fn load(
+        device: koharu_ml::Device,
+        config: &DetectionModel,
+        paddle_ocr: SharedPaddleOcrModel,
+    ) -> Result<Self> {
         let DetectionModel::KoharuLayoutRFDetrSeg2XL(config) = config;
-        let network = KoharuLayoutRFDetrSeg2XL::load(device).await?;
+        let network = KoharuLayoutRFDetrSeg2XL::load(device.clone()).await?;
+        let spotter = paddle_ocr_model(&paddle_ocr, device).await?;
         let mut thresholds = network.recommended_thresholds();
         thresholds.text = config.text_threshold.unwrap_or(thresholds.text);
         thresholds.bubble = config.bubble_threshold.unwrap_or(thresholds.bubble);
         thresholds.panel = config.panel_threshold.unwrap_or(thresholds.panel);
         Ok(Self {
             network: Arc::new(Mutex::new(network)),
+            spotter,
             thresholds,
         })
     }
@@ -161,7 +181,15 @@ impl Model {
             .await?
             .ok_or_else(|| anyhow!("page {page} has no source image"))?;
         let output = self.detect(image.clone()).await?;
-        build_patch(&input, &image, output, &generation(PRODUCER, MODEL_ID)?).await
+        let spotting = self.spot(image.clone()).await?;
+        build_patch(
+            &input,
+            &image,
+            output,
+            &spotting,
+            &generation(PRODUCER, MODEL_ID)?,
+        )
+        .await
     }
 
     async fn detect(&self, image: Arc<DynamicImage>) -> Result<KoharuLayoutDetections> {
@@ -175,6 +203,18 @@ impl Model {
         })
         .await
         .context("layout detection task panicked")?
+    }
+
+    async fn spot(&self, image: Arc<DynamicImage>) -> Result<String> {
+        let spotter = self.spotter.clone();
+        tokio::task::spawn_blocking(move || {
+            let spotter = spotter
+                .lock()
+                .map_err(|_| anyhow!("PaddleOCR-VL model lock is poisoned"))?;
+            Ok(spotter.inference(&image, PaddleOCRVLTask::Spotting)?.text)
+        })
+        .await
+        .context("source-text coverage task panicked")?
     }
 }
 
@@ -210,10 +250,164 @@ struct ImageSize {
     height: u32,
 }
 
+struct CoverageProposal {
+    text: String,
+    points: [Point; 4],
+    bbox: [f32; 4],
+}
+
+fn unmatched_spotting_coverage(
+    detections: &[KoharuLayoutDetection],
+    response: &str,
+    size: ImageSize,
+    scope: Option<crate::Bounds>,
+) -> Vec<CoverageProposal> {
+    let (proposals, invalid) = parse_spotting_proposals(response, size);
+    if invalid > 0 {
+        tracing::warn!(
+            invalid,
+            "ignored source-text coverage proposals with invalid LOC geometry"
+        );
+    }
+    let mut unmatched = Vec::new();
+    for proposal in proposals {
+        if scope.is_some_and(|scope| !intersects(proposal.bbox, scope)) {
+            continue;
+        }
+        let covered = detections.iter().any(|existing| {
+            existing.label == "text" && intersection_area(existing.bbox, proposal.bbox) > 0.0
+        });
+        if !covered {
+            unmatched.push(proposal);
+        }
+    }
+    unmatched
+}
+
+fn parse_spotting_proposals(response: &str, size: ImageSize) -> (Vec<CoverageProposal>, usize) {
+    if size.width == 0 || size.height == 0 {
+        return (Vec::new(), usize::from(response.contains("<|LOC_")));
+    }
+    let mut proposals = Vec::new();
+    let mut invalid = 0;
+    let mut text_start = 0;
+    let mut cursor = 0;
+    while let Some(offset) = response[cursor..].find("<|LOC_") {
+        let tag_start = cursor + offset;
+        let mut tag_end = tag_start;
+        let mut coordinates = Vec::with_capacity(8);
+        let mut coordinates_valid = true;
+        while let Some((coordinate, end)) = parse_loc_token(response, tag_end) {
+            if let Some(coordinate) = coordinate {
+                coordinates.push(coordinate);
+            } else {
+                coordinates_valid = false;
+            }
+            tag_end = end;
+        }
+        if tag_end == tag_start {
+            invalid += 1;
+            cursor = tag_start + "<|LOC_".len();
+            text_start = cursor;
+            continue;
+        }
+        let text = response[text_start..tag_start].trim();
+        if coordinates_valid
+            && coordinates.len() == 8
+            && !text.is_empty()
+            && text.len() <= 4096
+            && !text.contains('\0')
+            && !text.contains("<|LOC_")
+            && !text.contains("|>")
+        {
+            let coordinates: [u16; 8] = coordinates.try_into().expect("length checked");
+            if let Some(proposal) = spotting_proposal(text, coordinates, size) {
+                proposals.push(proposal);
+            } else {
+                invalid += 1;
+            }
+        } else {
+            invalid += 1;
+        }
+        cursor = tag_end;
+        text_start = tag_end;
+    }
+    (proposals, invalid)
+}
+
+fn parse_loc_token(value: &str, start: usize) -> Option<(Option<u16>, usize)> {
+    let suffix = value.get(start..)?.strip_prefix("<|LOC_")?;
+    let digits_end = suffix.find("|>")?;
+    let digits = suffix.get(..digits_end)?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let coordinate = digits
+        .parse::<u16>()
+        .ok()
+        .filter(|coordinate| *coordinate <= LOC_SCALE as u16);
+    Some((coordinate, start + "<|LOC_".len() + digits_end + 2))
+}
+
+fn spotting_proposal(
+    text: &str,
+    coordinates: [u16; 8],
+    size: ImageSize,
+) -> Option<CoverageProposal> {
+    let points = std::array::from_fn::<_, 4, _>(|index| Point {
+        x: f64::from(coordinates[index * 2]) / LOC_SCALE * f64::from(size.width),
+        y: f64::from(coordinates[index * 2 + 1]) / LOC_SCALE * f64::from(size.height),
+    });
+    if !valid_quadrilateral(&points) {
+        return None;
+    }
+    let left = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::INFINITY, f64::min);
+    let top = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::INFINITY, f64::min);
+    let right = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let bottom = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mask_left = left.floor().clamp(0.0, f64::from(size.width)) as u32;
+    let mask_top = top.floor().clamp(0.0, f64::from(size.height)) as u32;
+    let mask_right = right.ceil().clamp(0.0, f64::from(size.width)) as u32;
+    let mask_bottom = bottom.ceil().clamp(0.0, f64::from(size.height)) as u32;
+    let width = mask_right.checked_sub(mask_left)?;
+    let height = mask_bottom.checked_sub(mask_top)?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(CoverageProposal {
+        text: text.to_owned(),
+        points,
+        bbox: [left as f32, top as f32, right as f32, bottom as f32],
+    })
+}
+
+fn valid_quadrilateral(points: &[Point; 4]) -> bool {
+    let crosses = std::array::from_fn::<_, 4, _>(|index| {
+        let first = points[index];
+        let second = points[(index + 1) % 4];
+        let third = points[(index + 2) % 4];
+        (second.x - first.x) * (third.y - second.y) - (second.y - first.y) * (third.x - second.x)
+    });
+    crosses.iter().all(|cross| *cross > 0.0) || crosses.iter().all(|cross| *cross < 0.0)
+}
+
 async fn build_patch(
     input: &StageInput,
     image: &DynamicImage,
     output: KoharuLayoutDetections,
+    spotting: &str,
     generation: &Generation,
 ) -> Result<koharu_scene::Patch> {
     let page = input.page;
@@ -221,7 +415,7 @@ async fn build_patch(
     edit.observe_subtree(page)?;
     remove_previous_regions(input, &mut edit, generation)
         .context("failed to replace the previous detection regions")?;
-    write_page(input, &mut edit, page, image, output, generation)
+    write_page(input, &mut edit, page, image, output, generation, spotting)
         .await
         .context("failed to write detection output")?;
     finish(edit)
@@ -262,7 +456,8 @@ async fn write_page(
     page: EntityId,
     image: &DynamicImage,
     output: KoharuLayoutDetections,
-    generation: &Generation,
+    primary_generation: &Generation,
+    spotting: &str,
 ) -> Result<()> {
     let KoharuLayoutDetections {
         mut detections,
@@ -278,12 +473,22 @@ async fn write_page(
     }
     non_maximum_suppression(&mut detections, 0.5);
     sort_by_layout(&mut detections);
+    let coverage = unmatched_spotting_coverage(&detections, spotting, size, input.region);
 
     let image = image.to_rgb8();
-    let regions = write_regions(&input.scene, edit, page, &image, &detections, generation)
-        .context("failed to write detected regions")?;
-    link_dialogue_regions(edit, &regions, generation)
+    let regions = write_regions(
+        &input.scene,
+        edit,
+        page,
+        &image,
+        &detections,
+        primary_generation,
+    )
+    .context("failed to write detected regions")?;
+    link_dialogue_regions(edit, &regions, primary_generation)
         .context("failed to associate detected text with dialogue regions")?;
+    write_source_coverage_evidence(edit, page, &coverage, primary_generation)
+        .context("failed to write source coverage evidence")?;
     write_masks(input, edit, page, &detections, size)
         .await
         .context("failed to write detection masks")
@@ -430,6 +635,51 @@ fn write_region<'a>(
         content,
         layer,
     }))
+}
+
+fn write_source_coverage_evidence(
+    edit: &mut koharu_scene::Edit,
+    page: EntityId,
+    proposals: &[CoverageProposal],
+    generation: &Generation,
+) -> Result<()> {
+    let kind = RegionKind::new(SOURCE_COVERAGE_REGION_KIND)?;
+    for proposal in proposals {
+        let entity = edit
+            .add_entity(page, At::End)
+            .context("failed to create source coverage evidence")?;
+        edit.set(
+            entity,
+            &Geometry {
+                origin: Origin::Generated(generation.clone()),
+                points: proposal.points.into(),
+            },
+        )
+        .context("failed to set source coverage geometry")?;
+        edit.set(
+            entity,
+            &Region {
+                origin: Origin::Generated(generation.clone()),
+                kind: kind.clone(),
+                // Coverage hypotheses are deliberately debug labels rather than source text.
+                label: Some(proposal.text.clone()),
+            },
+        )
+        .context("failed to set source coverage metadata")?;
+        edit.set(
+            entity,
+            &DetectionAnalysis {
+                origin: Origin::Generated(generation.clone()),
+                labels: vec![DetectionLabel {
+                    kind: kind.clone(),
+                    // Spotting output has no calibrated detector confidence.
+                    confidence: 0.0,
+                }],
+            },
+        )
+        .context("failed to set source coverage analysis")?;
+    }
+    Ok(())
 }
 
 fn link_dialogue_regions(
@@ -1384,6 +1634,15 @@ async fn write_mask(
     if let Some(bounds) = input.region {
         preserve_mask_outside_region(input, page, "text-mask", bounds, &mut mask).await?;
     }
+    set_text_mask_asset(edit, page, mask, size)
+}
+
+fn set_text_mask_asset(
+    edit: &mut koharu_scene::Edit,
+    page: EntityId,
+    mask: GrayImage,
+    size: ImageSize,
+) -> Result<()> {
     let mut bytes = Cursor::new(Vec::new());
     PngEncoder::new_with_quality(&mut bytes, CompressionType::Fast, FilterType::NoFilter)
         .write_image(
@@ -1832,15 +2091,18 @@ fn area(bounds: [f32; 4]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use image::{Rgb, RgbImage};
+    use image::{DynamicImage, Rgb, RgbImage};
     use imageproc::{
         distance_transform::Norm,
         morphology::{close, dilate},
     };
-    use koharu_ml::koharu_layout_rfdetr_seg_2xl::{KoharuLayoutDetection, KoharuLayoutMask};
+    use koharu_ml::koharu_layout_rfdetr_seg_2xl::{
+        KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask,
+    };
     use koharu_scene::{
-        At, BubbleRegion, FitsTo, FlowsIn, Geometry, Inside, Origin, PageDraft, Session,
-        TextLayout, TextLayoutKind, TextRegion, Typography, WritingMode,
+        AssetRole, At, BubbleRegion, DetectionAnalysis, EntityOrigin, FitsTo, FlowsIn, Geometry,
+        Inside, Origin, PageDraft, RecognizedFrom, Region, RegionKind, RegionSpec, Session,
+        SourceText, TextLayout, TextLayoutKind, TextRegion, TextRole, Typography, WritingMode,
     };
 
     use super::{
@@ -1848,8 +2110,194 @@ mod tests {
         ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
         StageInput, StageProcessor, closed_mask_for, color_palette, generation, infer_typography,
         layout_order, link_dialogue_regions, mask_containment, mask_for, mask_geometry,
-        non_maximum_suppression, normalize_text_color, write_region,
+        non_maximum_suppression, normalize_text_color, write_page, write_region,
     };
+
+    #[tokio::test]
+    async fn unmatched_spotting_is_non_blocking_coverage_evidence() {
+        let mut session = Session::memory().await.unwrap();
+        let mut page = None;
+        let setup = session
+            .snapshot()
+            .patch(|edit| {
+                page = Some(edit.add_page(PageDraft::new("page", 100.0, 100.0), At::End)?);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(setup).await.unwrap().snapshot;
+        let page = page.unwrap();
+        let input = StageInput::new(
+            snapshot.clone(),
+            page,
+            None,
+            None,
+            std::sync::Arc::new(crate::ImageCache::default()),
+            None,
+            None,
+        );
+        let generation = generation(super::PRODUCER, super::MODEL_ID).unwrap();
+        let mut edit = snapshot.edit_as(generation.clone());
+        edit.observe_subtree(page).unwrap();
+        let primary = KoharuLayoutDetection {
+            label_id: 0,
+            label: "text".to_owned(),
+            score: 0.9,
+            bbox: [10.0, 10.0, 30.0, 30.0],
+            area: 400,
+            mask: KoharuLayoutMask {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 20,
+                pixels: vec![u8::MAX; 400],
+            },
+        };
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(100, 100, Rgb([255; 3])));
+        write_page(
+            &input,
+            &mut edit,
+            page,
+            &image,
+            KoharuLayoutDetections {
+                detections: vec![primary],
+                image_width: 100,
+                image_height: 100,
+            },
+            &generation,
+            "coverage hypothesis<|LOC_600|><|LOC_600|><|LOC_800|><|LOC_600|><|LOC_800|><|LOC_800|><|LOC_600|><|LOC_800|>",
+        )
+        .await
+        .unwrap();
+        let snapshot = session
+            .commit(edit.finish().unwrap())
+            .await
+            .unwrap()
+            .snapshot;
+
+        let regions = snapshot
+            .descendants(page)
+            .unwrap()
+            .filter_map(|entity| {
+                entity
+                    .component::<Region>()
+                    .unwrap()
+                    .map(|region| (entity.id(), region))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            regions
+                .iter()
+                .filter(|(_, region)| region.kind == TextRegion::kind())
+                .count(),
+            1
+        );
+
+        let coverage_kind = RegionKind::new("dev.koharu.region.source-coverage-evidence").unwrap();
+        let (coverage, coverage_region) = regions
+            .iter()
+            .find(|(_, region)| region.kind == coverage_kind)
+            .unwrap();
+        assert_eq!(
+            coverage_region.label.as_deref(),
+            Some("coverage hypothesis")
+        );
+        assert!(
+            snapshot
+                .component::<Geometry>(*coverage)
+                .unwrap()
+                .unwrap()
+                .points
+                .iter()
+                .all(|point| point.x >= 60.0 && point.y >= 60.0)
+        );
+        let analysis = snapshot
+            .component::<DetectionAnalysis>(*coverage)
+            .unwrap()
+            .unwrap();
+        assert_eq!(analysis.labels.len(), 1);
+        assert_eq!(analysis.labels[0].kind, coverage_kind);
+        assert_eq!(analysis.labels[0].confidence, 0.0);
+        let origin = snapshot
+            .component::<EntityOrigin>(*coverage)
+            .unwrap()
+            .unwrap();
+        let Origin::Generated(provenance) = origin.origin else {
+            panic!("coverage evidence must retain generated provenance");
+        };
+        assert_eq!(provenance.producer.as_str(), super::PRODUCER);
+        assert!(
+            provenance
+                .model
+                .as_deref()
+                .is_some_and(|model| model.contains("PaddleOCR-VL-1.6"))
+        );
+        assert!(
+            snapshot
+                .relations_to_as::<RecognizedFrom>(*coverage)
+                .next()
+                .is_none()
+        );
+
+        let text_regions = regions
+            .iter()
+            .filter(|(_, region)| region.kind == TextRegion::kind())
+            .map(|(entity, _)| *entity)
+            .collect::<Vec<_>>();
+        let primary = text_regions[0];
+        let content = snapshot
+            .relations_to_as::<RecognizedFrom>(primary)
+            .next()
+            .unwrap()
+            .value()
+            .source;
+        assert!(snapshot.component::<SourceText>(content).unwrap().is_none());
+        assert_eq!(
+            snapshot
+                .descendants(page)
+                .unwrap()
+                .filter(|entity| entity.component::<TextRole>().unwrap().is_some())
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .page(page)
+                .unwrap()
+                .text_group()
+                .unwrap()
+                .unwrap()
+                .text_layers()
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .component::<TextRole>(content)
+                .unwrap()
+                .unwrap()
+                .role,
+            "dev.koharu.text.free-text"
+        );
+        assert!(
+            snapshot
+                .descendants(page)
+                .unwrap()
+                .filter(|entity| entity.component::<SourceText>().unwrap().is_some())
+                .next()
+                .is_none()
+        );
+
+        let asset = snapshot
+            .asset(page, &AssetRole::new("text-mask").unwrap())
+            .unwrap()
+            .unwrap();
+        let bytes = snapshot.read_blob(asset.blob).await.unwrap();
+        let mask = image::load_from_memory(&bytes).unwrap().to_luma8();
+        assert_ne!(mask.get_pixel(20, 20).0[0], 0);
+        assert_eq!(mask.get_pixel(70, 70).0[0], 0);
+    }
 
     #[test]
     fn out_of_range_thresholds_fall_back_to_the_model_defaults() {
@@ -1860,6 +2308,7 @@ mod tests {
                 panel_threshold: Some(0.55),
             }),
             koharu_ml::Device::cpu(),
+            std::sync::Arc::new(crate::ModelCell::new()),
         );
 
         let DetectionModel::KoharuLayoutRFDetrSeg2XL(settings) = &processor.config;
@@ -1895,10 +2344,12 @@ mod tests {
             None,
             std::sync::Arc::new(crate::ImageCache::default()),
             None,
+            None,
         );
         let processor = Processor::new(
             DetectionModel::KoharuLayoutRFDetrSeg2XL(KoharuLayoutRFDetrSeg2XLConfig::default()),
             koharu_ml::Device::cpu(),
+            std::sync::Arc::new(crate::ModelCell::new()),
         );
 
         assert!(processor.skip(&input).unwrap());

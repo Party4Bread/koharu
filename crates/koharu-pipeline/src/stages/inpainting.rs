@@ -945,6 +945,7 @@ mod tests {
             None,
             None,
             Arc::new(crate::ImageCache::default()),
+            None,
             Some(crate::InpaintingMask {
                 page,
                 png: encode(&DynamicImage::ImageLuma8(transient)),
@@ -1003,6 +1004,7 @@ mod tests {
             None,
             Arc::new(crate::ImageCache::default()),
             None,
+            None,
         );
         let manual = StageInput::new(
             snapshot,
@@ -1010,6 +1012,7 @@ mod tests {
             None,
             None,
             Arc::new(crate::ImageCache::default()),
+            None,
             Some(crate::InpaintingMask {
                 page,
                 png: Arc::<[u8]>::from([]),

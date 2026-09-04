@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::Stage;
+use crate::{PreprocessingReport, Stage};
 use koharu_scene::EntityId;
 
 #[derive(Clone, Debug)]
@@ -25,9 +25,18 @@ pub enum Progress {
         model: String,
         elapsed: std::time::Duration,
     },
+    NoOp {
+        page: EntityId,
+        stage: Stage,
+        model: String,
+        elapsed: std::time::Duration,
+    },
     Skipped {
         page: EntityId,
         stage: Stage,
+    },
+    Preprocessed {
+        report: PreprocessingReport,
     },
 }
 

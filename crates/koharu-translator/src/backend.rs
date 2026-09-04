@@ -36,7 +36,6 @@ impl TranslationRequest {
         }
     }
 
-    #[cfg(test)]
     #[must_use]
     pub fn with_source_language(mut self, language: Language) -> Self {
         self.source_language = Some(language);

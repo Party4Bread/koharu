@@ -9,6 +9,7 @@ use specta::Type;
 
 use crate::{ProgressSink, Scope, Stage};
 use koharu_scene::EntityId;
+use koharu_translator::Language;
 
 #[derive(Clone, Debug)]
 pub struct InpaintingMask {
@@ -65,6 +66,7 @@ impl Operation {
 pub struct Request {
     pub operation: Operation,
     pub scope: Scope,
+    pub source_language: Option<Language>,
     pub stop: StopToken,
     pub progress: Option<ProgressSink>,
     pub inpainting_mask: Option<InpaintingMask>,
@@ -75,6 +77,7 @@ impl Default for Request {
         Self {
             operation: Operation::Full,
             scope: Scope::Project,
+            source_language: None,
             stop: StopToken::default(),
             progress: None,
             inpainting_mask: None,

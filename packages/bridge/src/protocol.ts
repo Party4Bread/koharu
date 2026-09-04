@@ -7,6 +7,7 @@ import { invoke as __TAURI_INVOKE, Channel } from "@tauri-apps/api/core";
 /** Commands */
 export const commands = {
 	getAgentStatus: () => __TAURI_INVOKE<AgentStatus>("get_agent_status"),
+	getAgentTraceLocation: (run: RunId) => __TAURI_INVOKE<TraceLocation>("get_agent_trace_location", { run }),
 	loginAgent: (onEvent: Channel<LoginEvent>) => __TAURI_INVOKE<AgentStatus>("login_agent", { onEvent }),
 	logoutAgent: () => __TAURI_INVOKE<AgentStatus>("logout_agent"),
 	saveAgentConfig: (config: Config) => __TAURI_INVOKE<Config>("save_agent_config", { config }),
@@ -180,7 +181,7 @@ export type EntityId = string;
 
 export type Error = string;
 
-export type Event = { type: "started"; run: RunId } | { type: "text_delta"; run: RunId; delta: string } | { type: "reasoning_delta"; run: RunId; delta: string } | { type: "tool_started"; run: RunId; call_id: string; name: string } | { type: "tool_finished"; run: RunId; call_id: string; name: string; changed: boolean; output: string } | { type: "completed"; run: RunId; message: string } | { type: "failed"; run: RunId; message: string } | { type: "cancelled"; run: RunId };
+export type Event = { type: "started"; run: RunId; trace: TraceLocation } | { type: "text_delta"; run: RunId; delta: string } | { type: "reasoning_delta"; run: RunId; delta: string } | { type: "tool_started"; run: RunId; call_id: string; name: string } | { type: "tool_finished"; run: RunId; call_id: string; name: string; changed: boolean; output: string } | { type: "completed"; run: RunId; message: string } | { type: "failed"; run: RunId; message: string } | { type: "cancelled"; run: RunId };
 
 export type ExportFormat = "png" | "psd";
 
@@ -488,6 +489,11 @@ export type TextContent = {
 export type TextLayoutKind = "point" | "paragraph";
 
 export type ThumbnailBytes = number[];
+
+export type TraceLocation = {
+	run: RunId,
+	path: string,
+};
 
 export type TransformFrame = {
 	element: EntityId,

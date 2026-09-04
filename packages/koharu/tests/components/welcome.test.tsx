@@ -22,6 +22,15 @@ function renderProjectFlow() {
 describe('StartView', () => {
   afterEach(() => vi.restoreAllMocks())
 
+  it('exposes the agent before a project is open', async () => {
+    vi.spyOn(commands, 'listProjects').mockResolvedValue([])
+    const openAgent = vi.fn()
+    render(<StartView onOpenAgent={openAgent} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Agent' }))
+    expect(openAgent).toHaveBeenCalledOnce()
+  })
+
   it('creates a managed project by name', async () => {
     let opened = false
     vi.spyOn(commands, 'getProject').mockImplementation(async () =>

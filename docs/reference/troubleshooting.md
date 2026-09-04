@@ -54,6 +54,8 @@ Open **Settings -> Providers** and verify the credential, base URL, and provider
 
 Only one device sign-in or agent request may run at a time. Cancel the existing attempt, verify the browser authorization completed for the intended ChatGPT account, and retry. Agent sign-in is separate from OpenAI provider credentials.
 
+On Linux, an error that says Secret Service is unavailable or locked means Koharu could not access the desktop's durable credential collection. Confirm that GNOME Keyring or KWallet's Secret Service interface is installed and running for the current desktop session, then unlock the login collection and retry. Koharu will not fall back to a plaintext file or the reboot-volatile kernel keyring.
+
 ## Text is missing or malformed
 
 Koharu renders translations only. Confirm that the layer has translated text, is visible, has nonzero opacity, and resolves a font covering the target script. Reset automatic fitting after large text changes.

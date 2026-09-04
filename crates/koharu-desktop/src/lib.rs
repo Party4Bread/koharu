@@ -1,5 +1,9 @@
 //! Native page preparation shared by browser presentation and export.
 
+mod export;
+
+pub use export::{ExportFormat, export_pages, rendered_preview};
+
 use std::{collections::HashSet, future::Future, sync::Arc};
 
 use anyhow::{Context as _, Result, bail};

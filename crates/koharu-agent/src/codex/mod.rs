@@ -4,16 +4,27 @@ mod protocol;
 mod stream;
 mod token_store;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow};
 use reqwest::{Client, StatusCode};
 use serde::Serialize;
 use specta::Type;
 
-use crate::{Control, Reasoning};
+#[cfg(test)]
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+use crate::{Control, Reasoning, provider::ProviderRequestError};
 
 pub use auth::Account;
 use auth::Auth;
-pub(crate) use protocol::{Request, function_output, message, project_context};
+pub(crate) use protocol::{
+    Request, function_output, message, project_context, retained_function_output,
+};
 pub(crate) use stream::{Delta, Turn};
 
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -41,6 +52,8 @@ pub enum LoginEvent {
 pub struct Codex {
     client: Client,
     auth: Auth,
+    #[cfg(test)]
+    scripted: Option<ScriptedCodex>,
 }
 
 impl Codex {
@@ -49,6 +62,8 @@ impl Codex {
         Ok(Self {
             auth: Auth::new(client.clone()),
             client,
+            #[cfg(test)]
+            scripted: None,
         })
     }
 
@@ -70,6 +85,14 @@ impl Codex {
 
     #[tracing::instrument(skip_all)]
     pub async fn models(&self) -> Result<Vec<CodexModel>> {
+        #[cfg(test)]
+        if self.scripted.is_some() {
+            return Ok(vec![CodexModel {
+                id: "test-codex".to_owned(),
+                name: "Test Codex".to_owned(),
+                reasoning: Vec::new(),
+            }]);
+        }
         catalog::models(&self.client, &self.auth).await
     }
 
@@ -82,6 +105,26 @@ impl Codex {
     where
         F: FnMut(Delta),
     {
+        #[cfg(test)]
+        if let Some(scripted) = &self.scripted {
+            control.ensure_running()?;
+            scripted.calls.fetch_add(1, Ordering::SeqCst);
+            scripted
+                .requests
+                .lock()
+                .expect("scripted request lock must not be poisoned")
+                .push(serde_json::to_value(request)?);
+            return match scripted
+                .responses
+                .lock()
+                .expect("scripted response lock must not be poisoned")
+                .pop_front()
+                .expect("scripted Codex response queue was exhausted")
+            {
+                ScriptedResponse::Turn(turn) => Ok(turn),
+                ScriptedResponse::Error(class) => Err(anyhow!(ProviderRequestError::new(class))),
+            };
+        }
         control.ensure_running()?;
         let session = self.auth.session().await?;
         let mut response = self.send(request, &session, control).await?;
@@ -93,7 +136,7 @@ impl Codex {
             let status = response.status();
             let mut body = response.text().await.unwrap_or_default();
             body.truncate(16 * 1024);
-            bail!("Codex returned {status}: {body}");
+            return Err(anyhow!(ProviderRequestError::from_http(status, &body)));
         }
         stream::read(response, control, publish).await
     }
@@ -118,11 +161,73 @@ impl Codex {
             .json(request)
             .send();
         tokio::select! {
-            response = send => Ok(response?),
+            response = send => response.map_err(|error| {
+                ProviderRequestError::from_transport(&error)
+                    .map_or_else(|| anyhow!(error), anyhow::Error::new)
+            }),
             () = control.cancelled() => {
                 control.ensure_running()?;
                 unreachable!("cancelled control must fail ensure_running")
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct ScriptedCodexHandle {
+    calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[cfg(test)]
+impl ScriptedCodexHandle {
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn requests(&self) -> Vec<serde_json::Value> {
+        self.requests
+            .lock()
+            .expect("scripted request lock must not be poisoned")
+            .clone()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct ScriptedCodex {
+    responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+    calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum ScriptedResponse {
+    Turn(Turn),
+    Error(crate::provider::ProviderErrorClass),
+}
+
+#[cfg(test)]
+impl Codex {
+    pub(crate) fn scripted(
+        responses: impl IntoIterator<Item = ScriptedResponse>,
+    ) -> (Self, ScriptedCodexHandle) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let scripted = ScriptedCodex {
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+            calls: Arc::clone(&calls),
+            requests: Arc::clone(&requests),
+        };
+        (
+            Self {
+                client: Client::new(),
+                auth: Auth::new(Client::new()),
+                scripted: Some(scripted),
+            },
+            ScriptedCodexHandle { calls, requests },
+        )
     }
 }

@@ -3,7 +3,10 @@ mod host;
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context as _, Result, anyhow};
-use koharu_agent::{Account, Agent, Codex, CodexModel, Config, Control, Event, LoginEvent, RunId};
+use koharu_agent::{
+    Account, Agent, Codex, CodexModel, Config, Control, Event, LoginEvent, ProviderRetryPolicy,
+    RunId, TraceLocation, trace_location,
+};
 use parking_lot::Mutex;
 use serde::Serialize;
 use specta::Type;
@@ -96,6 +99,16 @@ pub(crate) async fn get_agent_status(
     state: State<'_, AgentState>,
 ) -> std::result::Result<AgentStatus, Error> {
     Ok(state.status().await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) fn get_agent_trace_location(run: RunId) -> std::result::Result<TraceLocation, Error> {
+    let location = trace_location(run)?;
+    if !std::path::Path::new(&location.path).is_file() {
+        return Err(anyhow!("agent trace for run {run} does not exist").into());
+    }
+    Ok(location)
 }
 
 #[tracing::instrument(
@@ -191,6 +204,7 @@ pub(crate) async fn run_agent(
         return Err(anyhow!("Codex is not signed in").into());
     }
     let run = RunId::new();
+    let trace = trace_location(run)?;
     let control = Control::default();
     {
         let mut runs = state.runs.lock();
@@ -209,11 +223,18 @@ pub(crate) async fn run_agent(
         );
         let publish_control = control.clone();
         let result = agent
-            .run(run, prompt, control, |event| {
-                if on_event.send(event).is_err() {
-                    publish_control.cancel();
-                }
-            })
+            .run(
+                run,
+                prompt,
+                control,
+                ProviderRetryPolicy::disabled(),
+                trace,
+                |event| {
+                    if on_event.send(event).is_err() {
+                        publish_control.cancel();
+                    }
+                },
+            )
             .await;
         if let Err(error) = result {
             tracing::error!(%run, error = ?error, "agent request failed");

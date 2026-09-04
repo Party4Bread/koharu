@@ -5,9 +5,10 @@
 //! relation endpoints.
 
 use crate::{
-    BubbleRegion, DetectionAnalysis, EntityId, EntityOrigin, Error, Geometry, Group, OcrAnalysis,
-    Page, Project, RasterLayer, Region, RegionSpec, Relation, Result, SourceText, TextContent,
-    TextGroup, TextLayout, TextRegion, TextRole, Translation, Typography, Visibility,
+    BubbleRegion, DetectionAnalysis, EntityId, EntityOrigin, Error, Geometry, Group,
+    LogicalDialogue, OcrAnalysis, Page, Project, RasterLayer, Region, RegionSpec, Relation, Result,
+    SourceText, TextContent, TextGroup, TextLayout, TextRegion, TextRole, Translation, Typography,
+    Visibility,
     component::{Component, ComponentRecord, ValidationContext, decode, key},
     components::Assets,
     state::{Components, State},
@@ -60,6 +61,7 @@ component_schema! {
     DETECTION_ANALYSIS = 15 => DetectionAnalysis,
     ASSETS = 16 => Assets,
     ENTITY_ORIGIN = 17 => EntityOrigin,
+    LOGICAL_DIALOGUE = 18 => LogicalDialogue,
 }
 
 pub(crate) fn validate_components(
@@ -92,6 +94,7 @@ pub(crate) fn validate_entity(state: &State, id: EntityId) -> Result<()> {
     let has_ocr = has(OCR_ANALYSIS);
     let has_group = has(GROUP);
     let has_text_group = has(TEXT_GROUP);
+    let has_logical_dialogue = has(LOGICAL_DIALOGUE);
     let parent = state.parent_and_position(id)?.0;
     let parent_is_text_group = parent.is_some_and(|parent| {
         state.entity(parent).is_ok_and(|entity| {
@@ -102,7 +105,24 @@ pub(crate) fn validate_entity(state: &State, id: EntityId) -> Result<()> {
         })
     });
 
-    if (has_source || has_translation || has(TEXT_ROLE)) && !has_content {
+    if has_logical_dialogue {
+        let raw = entity
+            .components
+            .iter()
+            .find_map(|(key, raw)| (key.kind == LogicalDialogue::KIND).then_some(raw))
+            .expect("logical dialogue mask came from a component");
+        let record_exists = |candidate| state.entity(candidate).is_ok();
+        let blob_exists = |_| false;
+        let dialogue =
+            decode::<LogicalDialogue>(raw, &ValidationContext::new(&record_exists, &blob_exists))?;
+        if dialogue.members[0].content_id != id {
+            return Err(Error::invalid(format!(
+                "logical dialogue {id} must be stored on its primary content"
+            )));
+        }
+    }
+
+    if (has_source || has_translation || has(TEXT_ROLE) || has_logical_dialogue) && !has_content {
         Err(Error::invalid(format!(
             "entity {id} carries text content data but is not text content"
         )))

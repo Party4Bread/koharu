@@ -5,7 +5,10 @@ use eventsource_stream::Eventsource as _;
 use futures::StreamExt as _;
 use serde_json::Value;
 
-use crate::{Control, ToolCall};
+use crate::{
+    Control, ToolCall,
+    provider::{ProviderErrorClass, ProviderRequestError},
+};
 
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
@@ -14,6 +17,7 @@ pub(crate) enum Delta {
     Reasoning(String),
 }
 
+#[derive(Debug)]
 pub(crate) struct Turn {
     pub(crate) output: Vec<Value>,
     pub(crate) calls: Vec<ToolCall>,
@@ -45,7 +49,13 @@ where
         let Some(event) = event else {
             break;
         };
-        let event = event.map_err(|error| anyhow!("invalid Codex event stream: {error}"))?;
+        let event = event.map_err(|error| {
+            let message = error.to_string();
+            ProviderRequestError::from_stream_transport(&message).map_or_else(
+                || anyhow!("invalid Codex event stream: {message}"),
+                anyhow::Error::new,
+            )
+        })?;
         bytes = bytes.saturating_add(event.data.len());
         if bytes > MAX_STREAM_BYTES {
             bail!("Codex response stream exceeded {MAX_STREAM_BYTES} bytes");
@@ -89,17 +99,19 @@ where
                 break;
             }
             "response.incomplete" => {
-                bail!("Codex response was incomplete: {}", provider_error(&value));
+                return Err(anyhow!(ProviderRequestError::from_provider_event(&value)));
             }
             "response.failed" => {
-                bail!("Codex response failed: {}", provider_error(&value));
+                return Err(anyhow!(ProviderRequestError::from_provider_event(&value)));
             }
-            "error" => bail!("Codex returned an error: {}", provider_error(&value)),
+            "error" => return Err(anyhow!(ProviderRequestError::from_provider_event(&value))),
             _ => {}
         }
     }
     if !completed {
-        bail!("Codex response stream ended before completion");
+        return Err(anyhow!(ProviderRequestError::new(
+            ProviderErrorClass::ConnectionReset,
+        )));
     }
 
     if text.is_empty() {
@@ -140,13 +152,4 @@ fn output_text(output: &[Value]) -> String {
         .filter(|content| content.get("type").and_then(Value::as_str) == Some("output_text"))
         .filter_map(|content| content.get("text")?.as_str())
         .collect::<String>()
-}
-
-fn provider_error(value: &Value) -> String {
-    value
-        .get("message")
-        .or_else(|| value.get("error").and_then(|error| error.get("message")))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| value.to_string())
 }

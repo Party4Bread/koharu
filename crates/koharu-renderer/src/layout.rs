@@ -195,6 +195,7 @@ pub struct TextLayout<'a> {
     letter_spacing: f32,
     word_spacing: f32,
     cjk_punctuation_layout: bool,
+    prefer_korean_word_balance: bool,
 }
 
 fn largest_fitting_font_size<T>(
@@ -264,6 +265,7 @@ impl<'a> TextLayout<'a> {
             letter_spacing: 0.0,
             word_spacing: 0.0,
             cjk_punctuation_layout: false,
+            prefer_korean_word_balance: false,
         }
     }
 
@@ -395,6 +397,11 @@ impl<'a> TextLayout<'a> {
         self
     }
 
+    pub(crate) fn with_korean_word_balance(mut self, enabled: bool) -> Self {
+        self.prefer_korean_word_balance = enabled;
+        self
+    }
+
     pub fn run(&self, text: &str) -> Result<LayoutRun<'a>> {
         if let Some(font_size) = self.font_size {
             return self.run_with_size(text, font_size);
@@ -431,6 +438,20 @@ impl<'a> TextLayout<'a> {
                     |size| unhyphenated.run_with_size(text, size),
                     fits,
                 )?;
+                if let Some(current) = clean.as_ref()
+                    && self.prefer_korean_word_balance
+                    && has_consecutive_single_word_lines(text, current)
+                    && let Some(balanced) = largest_fitting_font_size(
+                        minimum,
+                        current.font_size,
+                        |size| unhyphenated.run_with_size(text, size),
+                        |candidate| {
+                            fits(candidate) && !has_consecutive_single_word_lines(text, candidate)
+                        },
+                    )?
+                {
+                    return Ok(balanced);
+                }
                 // Avoiding a word break is no longer useful once it pins the text to
                 // the configured readability floor. Compare raster-size buckets so
                 // hyphenation must recover a visible pixel, not a tuned percentage.
@@ -1383,6 +1404,23 @@ impl<'a> TextLayout<'a> {
         shaped.x_advance = shaped.glyphs.iter().map(|glyph| glyph.x_advance).sum();
         shaped.y_advance = shaped.glyphs.iter().map(|glyph| glyph.y_advance).sum();
     }
+}
+
+fn has_consecutive_single_word_lines(text: &str, layout: &LayoutRun<'_>) -> bool {
+    layout.lines.windows(2).any(|lines| {
+        let Some(between) = text.get(lines[0].range.end..lines[1].range.start) else {
+            return false;
+        };
+        !between.chars().any(|character| {
+            matches!(
+                character,
+                '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+            )
+        }) && lines.iter().all(|line| {
+            text.get(line.range.clone())
+                .is_some_and(|value| value.split_whitespace().count() == 1)
+        })
+    })
 }
 
 fn extend_advance(advance: f32, extra: f32) -> f32 {
@@ -2372,6 +2410,144 @@ mod tests {
             fitted.font_size,
             fitted.height
         );
+        Ok(())
+    }
+
+    #[test]
+    fn korean_comic_auto_fit_avoids_consecutive_single_word_continuation_lines()
+    -> anyhow::Result<()> {
+        let font = any_system_font();
+        let text = "이봐! 그럼 달라붙지 마!\n그리고 심장에 안 좋다고!";
+        let width = 125.0;
+        let height = 197.0;
+        let layout = TextLayout::new(&font)
+            .with_max_font_size(133.0)
+            .with_min_font_size(12.0)
+            .with_line_height(1.2)
+            .with_korean_word_balance(true)
+            .with_hyphenation_policy(HyphenationPolicy::LastResort)
+            .with_alignment(TextAlign::Center)
+            .with_max_width(width)
+            .with_max_height(height)
+            .with_comic_balloon(
+                width,
+                height,
+                vec![
+                    (101.0, -4.0),
+                    (100.0, -3.0),
+                    (9.0, -3.0),
+                    (8.0, -2.0),
+                    (9.0, 16.0),
+                    (8.0, 17.0),
+                    (8.0, 29.0),
+                    (7.0, 30.0),
+                    (6.0, 46.0),
+                    (4.0, 48.0),
+                    (1.0, 48.0),
+                    (-1.0, 46.0),
+                    (-4.0, 46.0),
+                    (-3.0, 53.0),
+                    (0.0, 59.0),
+                    (1.0, 70.0),
+                    (2.0, 71.0),
+                    (2.0, 76.0),
+                    (3.0, 77.0),
+                    (4.0, 115.0),
+                    (5.0, 116.0),
+                    (5.0, 122.0),
+                    (6.0, 123.0),
+                    (5.0, 137.0),
+                    (4.0, 138.0),
+                    (3.0, 145.0),
+                    (0.0, 149.0),
+                    (-2.0, 156.0),
+                    (0.0, 156.0),
+                    (3.0, 154.0),
+                    (8.0, 154.0),
+                    (14.0, 158.0),
+                    (20.0, 167.0),
+                    (22.0, 169.0),
+                    (25.0, 169.0),
+                    (29.0, 173.0),
+                    (30.0, 183.0),
+                    (32.0, 186.0),
+                    (35.0, 187.0),
+                    (36.0, 186.0),
+                    (41.0, 186.0),
+                    (42.0, 185.0),
+                    (50.0, 185.0),
+                    (58.0, 190.0),
+                    (64.0, 192.0),
+                    (77.0, 201.0),
+                    (78.0, 201.0),
+                    (80.0, 198.0),
+                    (85.0, 183.0),
+                    (101.0, 160.0),
+                    (105.0, 157.0),
+                    (108.0, 153.0),
+                    (109.0, 153.0),
+                    (116.0, 144.0),
+                    (120.0, 144.0),
+                    (122.0, 146.0),
+                    (126.0, 147.0),
+                    (126.0, 138.0),
+                    (125.0, 137.0),
+                    (125.0, 131.0),
+                    (126.0, 130.0),
+                    (126.0, 111.0),
+                    (127.0, 110.0),
+                    (127.0, 96.0),
+                    (128.0, 95.0),
+                    (128.0, 90.0),
+                    (129.0, 89.0),
+                    (128.0, 88.0),
+                    (124.0, 88.0),
+                    (122.0, 86.0),
+                    (119.0, 78.0),
+                    (118.0, 50.0),
+                    (117.0, 49.0),
+                    (117.0, 29.0),
+                    (116.0, 28.0),
+                    (116.0, 5.0),
+                    (117.0, 4.0),
+                    (117.0, -2.0),
+                    (116.0, -3.0),
+                    (103.0, -3.0),
+                ],
+                4.0,
+            )
+            .run(text)?;
+        let rendered_lines = layout
+            .lines
+            .iter()
+            .map(|line| text[line.range.clone()].trim())
+            .collect::<Vec<_>>();
+        let has_consecutive_single_word_lines =
+            layout.lines.windows(2).zip(rendered_lines.windows(2)).any(
+                |(layout_lines, rendered_lines)| {
+                    !text[layout_lines[0].range.end..layout_lines[1].range.start].contains('\n')
+                        && rendered_lines
+                            .iter()
+                            .all(|line| line.split_whitespace().count() == 1)
+                },
+            );
+
+        assert!(
+            !has_consecutive_single_word_lines,
+            "awkward rendered lines: {rendered_lines:?}"
+        );
+        assert_eq!(
+            rendered_lines,
+            [
+                "이봐! 그럼",
+                "달라붙지 마!",
+                "그리고",
+                "심장에 안",
+                "좋다고!"
+            ]
+        );
+        assert!(!layout.overflowed());
+        assert!(layout.font_size >= 12.0);
         Ok(())
     }
 

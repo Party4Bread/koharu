@@ -1,4 +1,6 @@
-use anyhow::{Context as _, Result};
+use std::path::PathBuf;
+
+use anyhow::{Context as _, Result, bail};
 use koharu_desktop::{CanvasState, Desktop};
 use koharu_scene::{AssetInput, AssetMetadata, AssetRole, At, PageDraft};
 use parking_lot::Mutex;
@@ -179,12 +181,11 @@ pub(crate) async fn subscribe(
     })
 }
 
-async fn replace_project(handle: &AppHandle<Cef>, opened: Project) -> Result<()> {
+pub(crate) async fn replace_project(handle: &AppHandle<Cef>, opened: Project) -> Result<()> {
     let snapshot = opened.snapshot();
     let page = opened.active_page();
     let info = opened.info();
 
-    handle.state::<AgentState>().reset().await;
     let processing = handle.state::<Processing>();
     for stop in processing.stops.lock().values() {
         stop.stop();
@@ -267,6 +268,7 @@ pub(crate) async fn create_project(
     name: String,
     handle: AppHandle<Cef>,
 ) -> std::result::Result<(), Error> {
+    handle.state::<AgentState>().reset().await;
     let library = handle.state::<ProjectLibrary>().inner().clone();
     let opened = library.create(&name).await?;
     replace_project(&handle, opened).await?;
@@ -285,6 +287,7 @@ pub(crate) async fn open_project(
     name: String,
     handle: AppHandle<Cef>,
 ) -> std::result::Result<(), Error> {
+    handle.state::<AgentState>().reset().await;
     let library = handle.state::<ProjectLibrary>().inner().clone();
     let opened = library.open(&name).await?;
     replace_project(&handle, opened).await?;
@@ -366,14 +369,8 @@ async fn close_current_project(handle: &AppHandle<Cef>) -> Result<()> {
 pub(crate) async fn import_pages(
     source: PageImportSource,
     window: WebviewWindow<Cef>,
-    desktop: State<'_, Desktop>,
-    project: State<'_, CurrentProject>,
-    processing: State<'_, Processing>,
-    canvas_channel: State<'_, CanvasChannel>,
+    handle: AppHandle<Cef>,
 ) -> std::result::Result<(), Error> {
-    if !processing.stops.lock().is_empty() {
-        return Err(anyhow::anyhow!("pages cannot be imported while processing is running").into());
-    }
     let extensions = import::Format::iter()
         .flat_map(|format| format.get_serializations())
         .collect::<Vec<_>>();
@@ -410,8 +407,54 @@ pub(crate) async fn import_pages(
     let Some(files) = files else {
         return Ok(());
     };
-    if files.is_empty() {
-        return Err(anyhow::anyhow!("no supported images were found in the selection").into());
+    let files = validate_import_paths(files)?;
+    import_page_paths(&handle, files).await?;
+    Ok(())
+}
+
+pub(crate) fn validate_import_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    if paths.is_empty() {
+        bail!("no supported page files were supplied");
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            if !path.is_absolute() {
+                bail!("page import path must be absolute: {}", path.display());
+            }
+            let path = path.canonicalize().with_context(|| {
+                format!("failed to resolve page import path {}", path.display())
+            })?;
+            if !path.is_file() {
+                bail!("page import path is not a file: {}", path.display());
+            }
+            let supported = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.parse::<import::Format>().is_ok());
+            if !supported {
+                bail!("unsupported page import path {}", path.display());
+            }
+            Ok(path)
+        })
+        .collect()
+}
+
+pub(crate) async fn import_page_paths(
+    handle: &AppHandle<Cef>,
+    files: Vec<PathBuf>,
+) -> Result<usize> {
+    if !handle.state::<Processing>().stops.lock().is_empty() {
+        bail!("pages cannot be imported while processing is running");
+    }
+    if handle
+        .state::<CurrentProject>()
+        .project
+        .lock()
+        .await
+        .is_none()
+    {
+        bail!("no project is open");
     }
     let pages = tokio::task::spawn_blocking(move || import::import(files))
         .await
@@ -419,7 +462,8 @@ pub(crate) async fn import_pages(
     let page_count = pages.len();
 
     let (commit, page) = {
-        let mut project = project.project.lock().await;
+        let current = handle.state::<CurrentProject>();
+        let mut project = current.project.lock().await;
         let project = project.as_mut().context("no project is open")?;
         let source = AssetRole::new("source")?;
         let patch = project.snapshot().patch(|edit| {
@@ -454,11 +498,38 @@ pub(crate) async fn import_pages(
         let page = project.active_page();
         (commit, page)
     };
+    let desktop = handle.state::<Desktop>();
     desktop.synchronize(&commit.snapshot, page, &commit).await?;
     let canvas = desktop.canvas_state();
-    canvas_channel.channel.publish(canvas);
+    handle.state::<CanvasChannel>().channel.publish(canvas);
     tracing::info!(target: "koharu_metrics", metric = "page_imported", page_count);
-    Ok(())
+    Ok(page_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_import_paths_must_be_absolute_supported_files() {
+        assert!(validate_import_paths(vec![PathBuf::from("page.png")]).is_err());
+
+        let directory =
+            std::env::temp_dir().join(format!("koharu-import-paths-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let supported = directory.join("page.PNG");
+        let unsupported = directory.join("page.txt");
+        std::fs::write(&supported, []).unwrap();
+        std::fs::write(&unsupported, []).unwrap();
+
+        assert_eq!(
+            validate_import_paths(vec![supported.clone()]).unwrap(),
+            vec![supported.canonicalize().unwrap()]
+        );
+        assert!(validate_import_paths(vec![unsupported]).is_err());
+        assert!(validate_import_paths(vec![directory.clone()]).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 #[tracing::instrument(

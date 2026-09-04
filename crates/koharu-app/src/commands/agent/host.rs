@@ -1,9 +1,9 @@
-use std::{future::Future, pin::Pin, sync::OnceLock};
+use std::{future::Future, path::PathBuf, pin::Pin, sync::OnceLock};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use koharu_agent::{Control, Host, Invocation, Tool, ToolCall};
+use koharu_agent::{Control, Host, Invocation, Tool, ToolCall, ToolImageProvenance};
 use koharu_desktop::{Desktop, Frame};
 use koharu_pipeline::{Committer, Operation, RunStatus, Scope, Stage, StageOutput, StopToken};
 use koharu_scene::{Commit, EntityId, Snapshot};
@@ -16,10 +16,10 @@ use crate::commands::{
     ChannelExt as _,
     canvas::{CanvasChannel, Point},
     editing::{GeometryUpdate, TypographyUpdate},
-    output,
+    lifecycle, output,
     preferences::Preferences,
     processing::{JobId, Processing},
-    project::{CurrentProject, Project, Typography},
+    project::{CurrentProject, Project, ProjectLibrary, Typography},
 };
 
 #[derive(Clone)]
@@ -36,13 +36,16 @@ impl KoharuHost {
         let (project, pages) = {
             let current = self.handle.state::<CurrentProject>();
             let current = current.project.lock().await;
-            let project = current.as_ref().context("no project is open")?;
-            let snapshot = project.snapshot();
-            let pages = Project::pages(&snapshot)?
-                .into_iter()
-                .map(|page| Project::page(&snapshot, page.id))
-                .collect::<Result<Vec<_>>>()?;
-            (project.info(), pages)
+            if let Some(project) = current.as_ref() {
+                let snapshot = project.snapshot();
+                let pages = Project::pages(&snapshot)?
+                    .into_iter()
+                    .map(|page| Project::page(&snapshot, page.id))
+                    .collect::<Result<Vec<_>>>()?;
+                (Some(project.info()), pages)
+            } else {
+                (None, Vec::new())
+            }
         };
         let preferences = Preferences::load()?;
         let fonts = self
@@ -150,6 +153,7 @@ impl KoharuHost {
         let request = koharu_pipeline::Request {
             operation,
             scope,
+            source_language: None,
             stop,
             progress: None,
             inpainting_mask: None,
@@ -186,6 +190,22 @@ impl Host for KoharuHost {
         TOOLS
             .get_or_init(|| {
                 vec![
+                    definition::<CreateProject>(
+                        "create_project",
+                        "Create and open a named project in Koharu's project library. Use a unique disposable name for autonomous test runs.",
+                    ),
+                    definition::<OpenProject>(
+                        "open_project",
+                        "Open an existing named project from Koharu's project library.",
+                    ),
+                    definition::<ImportPages>(
+                        "import_pages",
+                        "Import page sources from explicitly supplied absolute file paths without opening a native dialog.",
+                    ),
+                    definition::<ExportPages>(
+                        "export_pages",
+                        "Export the specified pages, or every page when pages is empty, to an existing explicitly supplied absolute directory without opening a native dialog.",
+                    ),
                     definition::<InspectProject>(
                         "inspect_project",
                         "Read the latest complete semantic project state after edits. This does not include page images.",
@@ -237,6 +257,54 @@ impl Host for KoharuHost {
     )]
     async fn invoke(&self, call: ToolCall, control: &Control) -> Result<Invocation> {
         match call.name.as_str() {
+            "create_project" => {
+                let arguments: CreateProject = arguments(&call)?;
+                let library = self.handle.state::<ProjectLibrary>().inner().clone();
+                let opened = library.create(&arguments.name).await?;
+                lifecycle::replace_project(&self.handle, opened).await?;
+                Invocation::changed(self.project_context().await?)
+            }
+            "open_project" => {
+                let arguments: OpenProject = arguments(&call)?;
+                let library = self.handle.state::<ProjectLibrary>().inner().clone();
+                let opened = library.open(&arguments.name).await?;
+                lifecycle::replace_project(&self.handle, opened).await?;
+                Invocation::changed(self.project_context().await?)
+            }
+            "import_pages" => {
+                let arguments: ImportPages = arguments(&call)?;
+                let paths = arguments.paths.into_iter().map(PathBuf::from).collect();
+                let paths = lifecycle::validate_import_paths(paths)?;
+                let page_count = lifecycle::import_page_paths(&self.handle, paths).await?;
+                Invocation::changed(json!({
+                    "page_count": page_count,
+                    "project": self.project_context().await?,
+                }))
+            }
+            "export_pages" => {
+                let arguments: ExportPages = arguments(&call)?;
+                let pages = entities(&arguments.pages)?;
+                let directory =
+                    output::validate_export_directory(&PathBuf::from(arguments.directory))?;
+                let paths = output::export_pages_to_directory(
+                    &self.handle,
+                    pages,
+                    arguments.format.into(),
+                    directory,
+                )
+                .await?;
+                let files = paths
+                    .iter()
+                    .map(|path| {
+                        path.to_str()
+                            .context("an exported file path is not valid UTF-8")
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Invocation::changed(json!({
+                    "files": files,
+                }))
+            }
             "inspect_project" => {
                 let _: InspectProject = arguments(&call)?;
                 Invocation::read(self.project_context().await?)
@@ -257,10 +325,17 @@ impl Host for KoharuHost {
                 let rasterizer = desktop.rasterizer().await?;
                 let bytes =
                     output::rendered_preview(&renderer, rasterizer, &snapshot, page).await?;
+                let provenance = ToolImageProvenance::ContentHash {
+                    algorithm: "blake3",
+                    digest: blake3::hash(&bytes).to_hex().to_string(),
+                    media_type: "image/webp".to_owned(),
+                    byte_length: bytes.len(),
+                };
                 Ok(
                     Invocation::read(json!({ "page": page, "label": label }))?.with_image(
                         format!("Rendered page {label} ({page})"),
                         format!("data:image/webp;base64,{}", STANDARD.encode(bytes)),
+                        provenance,
                     ),
                 )
             }
@@ -502,6 +577,45 @@ fn entities(values: &[String]) -> Result<Vec<EntityId>> {
 
 #[derive(Deserialize, JsonSchema)]
 struct InspectProject {}
+
+#[derive(Deserialize, JsonSchema)]
+struct CreateProject {
+    name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct OpenProject {
+    name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ImportPages {
+    paths: Vec<String>,
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum AgentExportFormat {
+    Png,
+    Psd,
+}
+
+impl From<AgentExportFormat> for output::ExportFormat {
+    fn from(value: AgentExportFormat) -> Self {
+        match value {
+            AgentExportFormat::Png => Self::Png,
+            AgentExportFormat::Psd => Self::Psd,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ExportPages {
+    #[serde(default)]
+    pages: Vec<String>,
+    format: AgentExportFormat,
+    directory: String,
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct ViewPage {

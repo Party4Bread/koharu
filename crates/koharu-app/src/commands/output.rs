@@ -1,17 +1,15 @@
-use anyhow::{Context as _, Result};
-use futures::{StreamExt as _, TryStreamExt as _, stream};
-use image::{
-    ExtendedColorType, ImageEncoder as _,
-    codecs::png::{CompressionType, FilterType, PngEncoder},
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
 };
-use koharu_psd::{PsdExportOptions, export_page};
-use koharu_rasterizer::{Raster, RasterOptions, Rasterizer};
-use koharu_renderer::{Frame, Renderer};
+
+use anyhow::{Context as _, Result, bail};
+use koharu_rasterizer::Rasterizer;
+use koharu_renderer::Renderer;
 use koharu_scene::{AssetRole, EntityId, Snapshot};
 use serde::Deserialize;
 use specta::Type;
-use std::sync::Arc;
-use tauri::{Cef, State, WebviewWindow, ipc::IpcResponse};
+use tauri::{AppHandle, Cef, Manager as _, State, WebviewWindow, ipc::IpcResponse};
 
 use super::{Error, project::CurrentProject};
 use koharu_desktop::Desktop;
@@ -35,6 +33,15 @@ pub enum ExportFormat {
     Psd,
 }
 
+impl From<ExportFormat> for koharu_desktop::ExportFormat {
+    fn from(value: ExportFormat) -> Self {
+        match value {
+            ExportFormat::Png => Self::Png,
+            ExportFormat::Psd => Self::Psd,
+        }
+    }
+}
+
 #[tracing::instrument(
     target = "koharu_metrics",
     name = "export",
@@ -47,14 +54,8 @@ pub(crate) async fn export_pages(
     window: WebviewWindow<Cef>,
     pages: Vec<EntityId>,
     format: ExportFormat,
-    project: State<'_, CurrentProject>,
-    desktop: State<'_, Desktop>,
+    handle: AppHandle<Cef>,
 ) -> std::result::Result<(), Error> {
-    let snapshot = {
-        let project = project.project.lock().await;
-        let project = project.as_ref().context("no project is open")?;
-        project.snapshot()
-    };
     let Some(directory) = rfd::AsyncFileDialog::new()
         .set_parent(&window)
         .pick_folder()
@@ -63,103 +64,51 @@ pub(crate) async fn export_pages(
     else {
         return Ok(());
     };
-    let pages = if pages.is_empty() {
-        snapshot.pages().map(|page| page.id()).collect()
-    } else {
-        pages
-    };
-    if pages.is_empty() {
-        return Err(anyhow::anyhow!("there are no pages to export").into());
+    let directory = validate_export_directory(&directory)?;
+    export_pages_to_directory(&handle, pages, format, directory).await?;
+    Ok(())
+}
+
+pub(crate) fn validate_export_directory(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!(
+            "export directory must be an absolute path: {}",
+            path.display()
+        );
     }
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve export directory {}", path.display()))?;
+    if !path.is_dir() {
+        bail!("export path is not a directory: {}", path.display());
+    }
+    Ok(path)
+}
+
+pub(crate) async fn export_pages_to_directory(
+    handle: &AppHandle<Cef>,
+    pages: Vec<EntityId>,
+    format: ExportFormat,
+    directory: PathBuf,
+) -> Result<Vec<PathBuf>> {
+    let snapshot = {
+        let current = handle.state::<CurrentProject>();
+        let project = current.project.lock().await;
+        let project = project.as_ref().context("no project is open")?;
+        project.snapshot()
+    };
+    let desktop = handle.state::<Desktop>();
     let renderer = desktop.renderer();
     let rasterizer = desktop.rasterizer().await?;
-    let jobs = pages
-        .into_iter()
-        .enumerate()
-        .map(|(index, page_id)| {
-            let page = snapshot.page(page_id)?.page()?;
-            let name = page
-                .label
-                .trim()
-                .trim_end_matches(|character: char| character == '.' || character.is_whitespace());
-            let name = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
-            let name = name
-                .chars()
-                .map(|character| {
-                    if matches!(
-                        character,
-                        '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
-                    ) {
-                        '_'
-                    } else {
-                        character
-                    }
-                })
-                .collect::<String>();
-            let stem = format!(
-                "{:04}_{}",
-                index + 1,
-                if name.is_empty() { "page" } else { &name }
-            );
-            Ok::<_, anyhow::Error>((page_id, stem))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    stream::iter(jobs)
-        .map(|(page_id, stem)| {
-            let renderer = renderer.clone();
-            let rasterizer = Arc::clone(&rasterizer);
-            let snapshot = snapshot.clone();
-            let directory = directory.clone();
-            async move {
-                let frame = renderer.render(&snapshot, page_id).await?;
-                match format {
-                    ExportFormat::Png => {
-                        let image =
-                            rasterize(Arc::clone(&rasterizer), &frame, RasterOptions::default())
-                                .await?
-                                .image;
-                        tokio::task::spawn_blocking(move || -> Result<()> {
-                            let file =
-                                std::fs::File::create(directory.join(format!("{stem}.png")))?;
-                            PngEncoder::new_with_quality(
-                                file,
-                                CompressionType::Best,
-                                FilterType::Adaptive,
-                            )
-                            .write_image(
-                                image.as_raw(),
-                                image.width(),
-                                image.height(),
-                                ExtendedColorType::Rgba8,
-                            )?;
-                            Ok(())
-                        })
-                        .await
-                        .context("PNG export worker stopped unexpectedly")??;
-                    }
-                    ExportFormat::Psd => {
-                        let bytes = export_page(
-                            Arc::clone(&rasterizer),
-                            &snapshot,
-                            &frame,
-                            &PsdExportOptions::default(),
-                        )
-                        .await?;
-                        tokio::fs::write(directory.join(format!("{stem}.psd")), bytes).await?;
-                    }
-                }
-                tracing::info!(
-                    target: "koharu_metrics",
-                    metric = "page_exported",
-                    format = ?format,
-                );
-                Ok::<_, anyhow::Error>(())
-            }
-        })
-        .buffer_unordered(4)
-        .try_collect::<Vec<_>>()
-        .await?;
-    Ok(())
+    koharu_desktop::export_pages(
+        renderer,
+        rasterizer,
+        snapshot,
+        pages,
+        format.into(),
+        directory,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -201,30 +150,28 @@ pub(crate) async fn rendered_preview(
     snapshot: &Snapshot,
     page: EntityId,
 ) -> Result<Vec<u8>> {
-    snapshot.page(page)?;
-    let frame = renderer.render(snapshot, page).await?;
-    let image = rasterize(rasterizer, &frame, RasterOptions::default())
-        .await?
-        .image;
-    tokio::task::spawn_blocking(move || {
-        let image = image::DynamicImage::ImageRgba8(image)
-            .resize(1024, 1024, image::imageops::FilterType::Lanczos3)
-            .to_rgba8();
-        let encoder = webp::Encoder::from_rgba(image.as_raw(), image.width(), image.height());
-        Ok::<_, anyhow::Error>(encoder.encode(85.0).to_vec())
-    })
-    .await
-    .context("preview encode worker stopped unexpectedly")?
+    koharu_desktop::rendered_preview(renderer, rasterizer, snapshot, page).await
 }
 
-async fn rasterize(
-    rasterizer: Arc<Rasterizer>,
-    frame: &Frame,
-    options: RasterOptions,
-) -> Result<Raster> {
-    let frame = frame.raster_frame()?;
-    tokio::task::spawn_blocking(move || rasterizer.rasterize(&frame, options))
-        .await
-        .context("rasterizer worker stopped unexpectedly")?
-        .map_err(Into::into)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_export_path_must_be_an_absolute_directory() {
+        assert!(validate_export_directory(Path::new("exports")).is_err());
+
+        let directory =
+            std::env::temp_dir().join(format!("koharu-export-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let file = directory.join("not-a-directory");
+        std::fs::write(&file, []).unwrap();
+
+        assert_eq!(
+            validate_export_directory(&directory).unwrap(),
+            directory.canonicalize().unwrap()
+        );
+        assert!(validate_export_directory(&file).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

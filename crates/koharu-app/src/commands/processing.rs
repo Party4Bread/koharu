@@ -119,6 +119,7 @@ pub(crate) async fn process(
         let mut request = koharu_pipeline::Request {
             operation,
             scope,
+            source_language: None,
             stop: stop.clone(),
             progress: None,
             inpainting_mask,
@@ -165,6 +166,23 @@ pub(crate) async fn process(
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
                     Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
                 }
+                Progress::NoOp {
+                    page,
+                    stage,
+                    model,
+                    elapsed,
+                } => {
+                    tracing::info!(
+                        target: "koharu_metrics",
+                        metric = "stage_no_op",
+                        stage = %stage,
+                        model,
+                        duration_ms = elapsed.as_secs_f64() * 1000.0,
+                    );
+                    let mut progress = progress.lock();
+                    progress.0 = progress.0.saturating_add(1).min(progress.1);
+                    Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
+                }
                 Progress::Skipped { page, stage } => {
                     tracing::info!(
                         target: "koharu_metrics",
@@ -181,6 +199,16 @@ pub(crate) async fn process(
                         metric = "stage_running",
                         stage = %stage,
                         model,
+                    );
+                    None
+                }
+                Progress::Preprocessed { report } => {
+                    tracing::info!(
+                        target: "koharu_metrics",
+                        metric = "translation_preprocessing",
+                        page = %report.page_id,
+                        merges = report.merges.len(),
+                        style_adjustments = report.style_adjustments.len(),
                     );
                     None
                 }
