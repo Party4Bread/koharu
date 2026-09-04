@@ -214,6 +214,56 @@ impl Snapshot {
         self.storage.blobs().get(id).await.map_err(Into::into)
     }
 
+    /// Fingerprints the complete content and hierarchy owned by one page, including incident
+    /// relations. Blob identifiers are content hashes, so referenced raster inputs participate
+    /// without reading their bytes again.
+    pub fn page_content_fingerprint(&self, id: EntityId) -> Result<[u8; 32]> {
+        let page = self.state.page(id)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"koharu-scene-page-content-v1\0");
+        for entity_id in page.ordered_ids() {
+            let entity = page.entity(entity_id)?;
+            hash_fingerprint_bytes(&mut hasher, entity_id.as_uuid().as_bytes());
+            match entity.parent {
+                Some(parent) => {
+                    hasher.update(&[1]);
+                    hash_fingerprint_bytes(
+                        &mut hasher,
+                        page.entities[parent].id.as_uuid().as_bytes(),
+                    );
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+            for (key, component) in &entity.components {
+                hash_fingerprint_bytes(&mut hasher, key.kind.as_bytes());
+                hash_fingerprint_bytes(&mut hasher, &component.fingerprint());
+            }
+            hasher.update(&[0xff]);
+        }
+        let mut relations = self
+            .state
+            .relations
+            .iter()
+            .filter(|(_, relation)| {
+                self.state.entity_pages.get(&relation.value.source) == Some(&id)
+                    || self.state.entity_pages.get(&relation.value.target) == Some(&id)
+            })
+            .collect::<Vec<_>>();
+        relations.sort_unstable_by_key(|(relation_id, _)| **relation_id);
+        for (relation_id, relation) in relations {
+            hash_fingerprint_bytes(&mut hasher, relation_id.as_uuid().as_bytes());
+            hash_fingerprint_bytes(&mut hasher, &revision::to_vec(&relation.value)?);
+            for (key, component) in &relation.components {
+                hash_fingerprint_bytes(&mut hasher, key.kind.as_bytes());
+                hash_fingerprint_bytes(&mut hasher, &component.fingerprint());
+            }
+            hasher.update(&[0xfe]);
+        }
+        Ok(*hasher.finalize().as_bytes())
+    }
+
     #[must_use]
     pub fn edit(&self) -> Edit {
         Edit::new(self.clone(), None)
@@ -247,6 +297,11 @@ impl Snapshot {
         }
         Ok(current)
     }
+}
+
+fn hash_fingerprint_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 #[derive(Copy, Clone, Debug)]

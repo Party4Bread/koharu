@@ -224,7 +224,7 @@ struct ReviewManifest<'a> {
 pub(crate) fn run_visual_review(
     bundle_directory: &Path,
     judge_command: Option<&Path>,
-    pages: Vec<ReviewPageInput>,
+    pages: Vec<ReviewBundlePage>,
     deterministic_acceptance_passed: bool,
     attempt: u32,
     scene_revision: Revision,
@@ -360,7 +360,7 @@ pub(crate) fn run_visual_review(
 
 fn write_bundle(
     bundle_directory: &Path,
-    pages: Vec<ReviewPageInput>,
+    pages: Vec<ReviewBundlePage>,
     deterministic_acceptance_passed: bool,
     attempt: u32,
     scene_revision: Revision,
@@ -379,37 +379,6 @@ fn write_bundle(
             bundle_directory.display()
         )
     })?;
-    let mut bundled_pages = Vec::with_capacity(pages.len());
-    for (index, page) in pages.into_iter().enumerate() {
-        let stem = format!("page-{index:04}");
-        let original_extension = media_extension(&page.original_media_type);
-        let original = write_artifact(
-            bundle_directory,
-            &format!("{stem}-original.{original_extension}"),
-            &page.original_media_type,
-            &page.original_bytes,
-        )?;
-        let rendered_preview = write_artifact(
-            bundle_directory,
-            &format!("{stem}-rendered.webp"),
-            "image/webp",
-            &page.preview_bytes,
-        )?;
-        let semantic_bytes = serde_json::to_vec_pretty(&page.semantic_elements)?;
-        let semantic_elements = write_artifact(
-            bundle_directory,
-            &format!("{stem}-semantic-elements.json"),
-            "application/json",
-            &semantic_bytes,
-        )?;
-        bundled_pages.push(ReviewBundlePage {
-            page_id: page.page_id,
-            label: page.label,
-            original,
-            rendered_preview,
-            semantic_elements,
-        });
-    }
     let manifest_path = bundle_directory.join("manifest.json");
     let manifest = ReviewManifest {
         schema_version: VISUAL_REVIEW_SCHEMA_VERSION,
@@ -430,13 +399,58 @@ fn write_bundle(
             "every skipped_difficult_sfx item is truly decorative and difficult to OCR, and no required dialogue, caption, UI, or general free text was skipped",
         ],
         corrections,
-        pages: &bundled_pages,
+        pages: &pages,
     };
     write_new(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
     Ok(ReviewBundle {
         directory: path_string(bundle_directory)?,
         manifest: path_string(&manifest_path)?,
-        pages: bundled_pages,
+        pages,
+    })
+}
+
+pub(crate) fn write_page_artifacts(
+    directory: &Path,
+    page: ReviewPageInput,
+) -> Result<ReviewBundlePage> {
+    if directory.exists() {
+        bail!(
+            "visual-review page artifact directory already exists: {}",
+            directory.display()
+        );
+    }
+    std::fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "failed to create visual-review page artifact directory {}",
+            directory.display()
+        )
+    })?;
+    let original_extension = media_extension(&page.original_media_type);
+    let original = write_artifact(
+        directory,
+        &format!("original.{original_extension}"),
+        &page.original_media_type,
+        &page.original_bytes,
+    )?;
+    let rendered_preview = write_artifact(
+        directory,
+        "rendered.webp",
+        "image/webp",
+        &page.preview_bytes,
+    )?;
+    let semantic_bytes = serde_json::to_vec_pretty(&page.semantic_elements)?;
+    let semantic_elements = write_artifact(
+        directory,
+        "semantic-elements.json",
+        "application/json",
+        &semantic_bytes,
+    )?;
+    Ok(ReviewBundlePage {
+        page_id: page.page_id,
+        label: page.label,
+        original,
+        rendered_preview,
+        semantic_elements,
     })
 }
 
@@ -497,6 +511,21 @@ mod tests {
         }
     }
 
+    fn page_artifacts(parent: &Path, original: &[u8], preview: &[u8]) -> ReviewBundlePage {
+        write_page_artifacts(
+            &parent.join("page-artifacts"),
+            ReviewPageInput {
+                page_id: EntityId::new(),
+                label: "page.png".to_owned(),
+                original_media_type: "image/png".to_owned(),
+                original_bytes: original.to_vec(),
+                preview_bytes: preview.to_vec(),
+                semantic_elements: serde_json::json!({ "elements": [] }),
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn bundle_only_review_is_pending_and_contains_all_three_artifacts() {
         let parent = tempfile::tempdir().unwrap();
@@ -504,14 +533,7 @@ mod tests {
         let record = run_visual_review(
             &bundle,
             None,
-            vec![ReviewPageInput {
-                page_id: EntityId::new(),
-                label: "page.png".to_owned(),
-                original_media_type: "image/png".to_owned(),
-                original_bytes: b"original".to_vec(),
-                preview_bytes: b"preview".to_vec(),
-                semantic_elements: serde_json::json!({ "elements": [] }),
-            }],
+            vec![page_artifacts(parent.path(), b"original", b"preview")],
             false,
             1,
             Revision::ZERO,
@@ -585,14 +607,11 @@ mod tests {
         let record = run_visual_review(
             &parent.path().join("bundle"),
             Some(&judge),
-            vec![ReviewPageInput {
-                page_id: EntityId::new(),
-                label: "page.png".to_owned(),
-                original_media_type: "image/png".to_owned(),
-                original_bytes: b"original source pixels".to_vec(),
-                preview_bytes: b"rendered preview pixels".to_vec(),
-                semantic_elements: serde_json::json!({ "elements": [] }),
-            }],
+            vec![page_artifacts(
+                parent.path(),
+                b"original source pixels",
+                b"rendered preview pixels",
+            )],
             true,
             1,
             Revision::ZERO,

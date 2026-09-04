@@ -160,6 +160,12 @@ impl Renderer {
             .map_err(Error::FontResource)
     }
 
+    /// Returns the active settings that affect text compilation and rendering.
+    #[must_use]
+    pub fn typesetting_config(&self) -> TypesettingConfig {
+        (**self.inner.typesetting.load()).clone()
+    }
+
     pub async fn font_preview(
         &self,
         family_name: &str,

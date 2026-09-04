@@ -73,8 +73,9 @@ use crate::{
     },
     review::{
         AGENT_VISUAL_SEMANTIC_REVIEW_SCHEMA_VERSION, AgentVisualSemanticReview,
-        CompactedTranslationMemberEvidence, CompactedTranslationSemanticReview, ReviewPageInput,
-        VisualReviewDecision, VisualReviewRecord, VisualReviewStatus, run_visual_review,
+        CompactedTranslationMemberEvidence, CompactedTranslationSemanticReview, ReviewBundlePage,
+        ReviewPageInput, VisualReviewDecision, VisualReviewRecord, VisualReviewStatus,
+        run_visual_review, write_page_artifacts,
     },
     sfx::{
         DECORATIVE_SFX_DECISION_SCHEMA_VERSION, DECORATIVE_SFX_ROLE, DecorativeSfxDecision,
@@ -936,6 +937,32 @@ fn import_pages(inputs: Vec<PathBuf>) -> Result<Vec<ImportedPage>> {
         .collect()
 }
 
+fn review_page_fingerprint(
+    snapshot: &Snapshot,
+    page: EntityId,
+    original: &OriginalPage,
+    semantic_elements: &Value,
+    renderer: &Renderer,
+) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"koharu-review-page-artifacts-v1\0");
+    update_fingerprint(&mut hasher, &snapshot.page_content_fingerprint(page)?);
+    update_fingerprint(&mut hasher, original.label.as_bytes());
+    update_fingerprint(&mut hasher, original.media_type.as_bytes());
+    update_fingerprint(&mut hasher, blake3::hash(&original.bytes).as_bytes());
+    update_fingerprint(
+        &mut hasher,
+        &serde_json::to_vec(&renderer.typesetting_config())?,
+    );
+    update_fingerprint(&mut hasher, &serde_json::to_vec(semantic_elements)?);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn update_fingerprint(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
 #[derive(Clone)]
 pub(crate) struct HarnessHost {
     project: DisposableProject,
@@ -958,6 +985,7 @@ pub(crate) struct HarnessHost {
     acceptance: Arc<SyncMutex<Option<AcceptanceRecord>>>,
     visual_review: Arc<SyncMutex<Option<VisualReviewRecord>>>,
     review_history: Arc<SyncMutex<Vec<VisualReviewRecord>>>,
+    review_page_cache: Arc<SyncMutex<BTreeMap<String, ReviewBundlePage>>>,
     page_reviews: Arc<SyncMutex<PageReviewState>>,
     attempted_repair_actions: Arc<SyncMutex<BTreeSet<RepairActionIdentity>>>,
     repair_stop: Arc<SyncMutex<Option<RepairStopDiagnostic>>>,
@@ -1026,6 +1054,7 @@ impl HarnessHost {
             acceptance: Arc::new(SyncMutex::new(None)),
             visual_review: Arc::new(SyncMutex::new(None)),
             review_history: Arc::new(SyncMutex::new(Vec::new())),
+            review_page_cache: Arc::new(SyncMutex::new(BTreeMap::new())),
             page_reviews: Arc::new(SyncMutex::new(PageReviewState::default())),
             attempted_repair_actions: Arc::new(SyncMutex::new(BTreeSet::new())),
             repair_stop: Arc::new(SyncMutex::new(None)),
@@ -1920,33 +1949,60 @@ impl HarnessHost {
         let mut pages = Vec::with_capacity(originals.len());
         for (index, (original, page)) in originals.iter().zip(&inspection.project.pages).enumerate()
         {
+            let page_corrections = corrections
+                .iter()
+                .filter(|correction| {
+                    page.text_elements
+                        .iter()
+                        .any(|element| element.id == correction.element_id)
+                })
+                .collect::<Vec<_>>();
+            let semantic_elements = json!({
+                "schema_version": 6,
+                "source_language": acceptance.source_language,
+                "target_language": acceptance.target_language,
+                "thresholds": acceptance.thresholds,
+                "page": page,
+                "acceptance": acceptance.pages.get(index),
+                "corrections": page_corrections,
+            });
+            let fingerprint = review_page_fingerprint(
+                &snapshot,
+                page.id,
+                original,
+                &semantic_elements,
+                &self.renderer,
+            )?;
+            if let Some(cached) = self.review_page_cache.lock().get(&fingerprint).cloned() {
+                pages.push(cached);
+                continue;
+            }
             let preview_bytes =
                 rendered_preview(&self.renderer, rasterizer.clone(), &snapshot, page.id)
                     .await
                     .with_context(|| {
                         format!("failed to render review preview for {}", page.label)
                     })?;
-            pages.push(ReviewPageInput {
+            let cache_directory = self
+                .review_bundle_directory
+                .join("page-artifacts")
+                .join(&fingerprint);
+            let input = ReviewPageInput {
                 page_id: page.id,
                 label: original.label.clone(),
                 original_media_type: original.media_type.clone(),
                 original_bytes: original.bytes.to_vec(),
                 preview_bytes,
-                semantic_elements: json!({
-                    "schema_version": 6,
-                    "source_language": acceptance.source_language,
-                    "target_language": acceptance.target_language,
-                    "thresholds": acceptance.thresholds,
-                    "page": page,
-                    "acceptance": acceptance.pages.get(index),
-                    "corrections": corrections
-                        .iter()
-                        .filter(|correction| page.text_elements.iter().any(|element| {
-                            element.id == correction.element_id
-                        }))
-                        .collect::<Vec<_>>(),
-                }),
-            });
+                semantic_elements,
+            };
+            let artifact_page =
+                tokio::task::spawn_blocking(move || write_page_artifacts(&cache_directory, input))
+                    .await
+                    .context("visual-review page artifact worker stopped unexpectedly")??;
+            self.review_page_cache
+                .lock()
+                .insert(fingerprint, artifact_page.clone());
+            pages.push(artifact_page);
         }
         let bundle_directory = self
             .review_bundle_directory
@@ -13537,7 +13593,7 @@ mod tests {
         .map(|(name, pixel)| {
             let input = fixture.path().join(name);
             let mut bytes = Cursor::new(Vec::new());
-            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 3, pixel))
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(64, 64, pixel))
                 .write_to(&mut bytes, image::ImageFormat::Png)
                 .unwrap();
             std::fs::write(&input, bytes.into_inner()).unwrap();
@@ -13555,8 +13611,184 @@ mod tests {
         )
         .await
         .unwrap();
-        let snapshot = host.project.session().lock().await.snapshot();
+        let mut session = host.project.session().lock().await;
+        let snapshot = session.snapshot();
         let page_ids = snapshot.pages().map(|page| page.id()).collect::<Vec<_>>();
+        let generation = Generation::new(ProducerId::new("dev.koharu.test.detector").unwrap());
+        let mut edit = snapshot.edit_as(generation.clone());
+        let mut page_one_element = None;
+        for (index, page) in page_ids.iter().copied().enumerate() {
+            let source_region = edit
+                .add_analysis_region::<TextRegion>(
+                    page,
+                    At::End,
+                    &Geometry::rectangle(8.0, 8.0, 48.0, 48.0),
+                    Some("detected test text".to_owned()),
+                )
+                .unwrap();
+            edit.set(
+                source_region,
+                &DetectionAnalysis {
+                    origin: koharu_scene::Origin::Generated(generation.clone()),
+                    labels: vec![DetectionLabel {
+                        kind: TextRegion::kind(),
+                        confidence: 0.99,
+                    }],
+                },
+            )
+            .unwrap();
+            edit.set(
+                source_region,
+                &OcrAnalysis {
+                    origin: koharu_scene::Origin::Generated(generation.clone()),
+                    direction: TextDirection::Horizontal,
+                    confidence: Some(0.99),
+                    line_boundaries: Vec::new(),
+                },
+            )
+            .unwrap();
+            let content = edit.add_text_content(page, At::End).unwrap();
+            let layer = edit
+                .add_text_layer(
+                    page,
+                    At::End,
+                    content,
+                    &TextLayout {
+                        origin: koharu_scene::Origin::User,
+                        kind: TextLayoutKind::Paragraph,
+                    },
+                )
+                .unwrap();
+            edit.relate::<koharu_scene::RecognizedFrom>(content, source_region)
+                .unwrap();
+            edit.relate::<FitsTo>(layer, source_region).unwrap();
+            edit.set(
+                content,
+                &SourceText {
+                    text: Authored::user(format!("source {index}")),
+                    language: Some(LanguageTag::new("ja-JP").unwrap()),
+                },
+            )
+            .unwrap();
+            edit.set(
+                content,
+                &Translation {
+                    text: Authored::user(if index == 0 { "초기" } else { "유지" }.to_owned()),
+                    language: Some(LanguageTag::new("ko-KR").unwrap()),
+                },
+            )
+            .unwrap();
+            edit.set(
+                layer,
+                &Typography {
+                    origin: koharu_scene::Origin::User,
+                    preferred_font: None,
+                    font_weight: None,
+                    font_style: None,
+                    size: Some(12.0),
+                    auto_fit: true,
+                    color: Some([0, 0, 0, 255]),
+                    stroke_color: None,
+                    stroke_width: None,
+                    alignment: None,
+                    writing_mode: Some(WritingMode::Horizontal),
+                    extensions: Default::default(),
+                },
+            )
+            .unwrap();
+            edit.set(layer, &Geometry::rectangle(8.0, 8.0, 48.0, 48.0))
+                .unwrap();
+            if index == 0 {
+                page_one_element = Some(layer);
+            }
+        }
+        let revision = session
+            .commit(edit.finish().unwrap())
+            .await
+            .unwrap()
+            .snapshot
+            .revision();
+        let page_one_element = page_one_element.unwrap();
+        drop(session);
+        *host.page_reviews.lock() =
+            PageReviewState::at_revision(page_ids.iter().copied(), revision);
+        host.source_analysis_completed
+            .store(true, Ordering::Release);
+        host.pipeline_completed.store(true, Ordering::Release);
+
+        let first_review = host.record_visual_review().await.unwrap();
+        assert!(first_review.deterministic_acceptance_passed);
+        let evidence = host
+            .inspect_page_evidence(&ToolCall {
+                call_id: "cache-page-one-evidence".to_owned(),
+                name: "inspect_page_evidence".to_owned(),
+                arguments: json!({ "page_ordinal": 1 }).to_string(),
+            })
+            .await
+            .unwrap();
+        host.revise_page_translation(&ToolCall {
+            call_id: "cache-page-one-semantic-revision".to_owned(),
+            name: "revise_page_translation".to_owned(),
+            arguments: json!({
+                "page_ordinal": 1,
+                "evidence": {
+                    "scene_revision": evidence.value["scene_revision"],
+                    "source_evidence_dossier_blake3": evidence.value["source_evidence_dossier_blake3"],
+                    "source_debug_artifact_blake3": evidence.value["source_debug_artifact_blake3"],
+                    "dossier_blake3": evidence.value["dossier_blake3"],
+                    "debug_artifact_blake3": evidence.value["debug_artifact_blake3"],
+                },
+                "edits": [{
+                    "element": page_one_element,
+                    "translation": {
+                        "text": "수정",
+                        "language": "ko-KR",
+                    },
+                }],
+                "page_rationale": "exercise page-scoped semantic artifact invalidation",
+            })
+            .to_string(),
+        })
+        .await
+        .unwrap();
+
+        let second_review = host.record_visual_review().await.unwrap();
+        let first_page_one = &first_review.bundle.pages[0];
+        let first_page_two = &first_review.bundle.pages[1];
+        let second_page_one = &second_review.bundle.pages[0];
+        let second_page_two = &second_review.bundle.pages[1];
+        for (first, second) in [
+            (&first_page_two.original, &second_page_two.original),
+            (
+                &first_page_two.rendered_preview,
+                &second_page_two.rendered_preview,
+            ),
+            (
+                &first_page_two.semantic_elements,
+                &second_page_two.semantic_elements,
+            ),
+        ] {
+            assert_eq!(first.path, second.path);
+            assert_eq!(first.blake3, second.blake3);
+        }
+        assert_ne!(
+            first_page_one.rendered_preview.path,
+            second_page_one.rendered_preview.path
+        );
+        assert_ne!(
+            first_page_one.rendered_preview.blake3,
+            second_page_one.rendered_preview.blake3
+        );
+        assert_ne!(
+            first_page_one.semantic_elements.path,
+            second_page_one.semantic_elements.path
+        );
+        assert_ne!(
+            first_page_one.semantic_elements.blake3,
+            second_page_one.semantic_elements.blake3
+        );
+
+        let snapshot = host.project.session().lock().await.snapshot();
         let revision = snapshot.revision();
         let mut review = pending_agent_review(revision, page_ids[0]);
         review.bundle.pages.push(crate::review::ReviewBundlePage {
