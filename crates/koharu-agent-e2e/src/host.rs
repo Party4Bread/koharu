@@ -155,20 +155,14 @@ impl ScreeningEvidenceStage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SemanticReviewStage {
-    InspectSourceEvidence,
-    ViewPageSourceDebug,
-    ReviewPageTranslation,
-    ViewPageDebug,
+    InspectPageEvidence,
     SubmitVisualSemanticReview,
 }
 
 impl SemanticReviewStage {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::InspectSourceEvidence => "inspect_source_evidence",
-            Self::ViewPageSourceDebug => "view_page_source_debug",
-            Self::ReviewPageTranslation => "review_page_translation",
-            Self::ViewPageDebug => "view_page_debug",
+            Self::InspectPageEvidence => "inspect_page_evidence",
             Self::SubmitVisualSemanticReview => "submit_visual_semantic_review",
         }
     }
@@ -485,12 +479,7 @@ fn phase_tool_names(inputs: &WorkflowSurfaceInputs) -> (WorkflowPhase, Vec<&'sta
         return (WorkflowPhase::SourceEvidence, names);
     }
 
-    let evidence_tools = [
-        "inspect_source_evidence",
-        "view_page_source_debug",
-        "review_page_translation",
-        "view_page_debug",
-    ];
+    let evidence_tools = ["inspect_page_evidence"];
     let Some(review) = inputs.review.as_ref() else {
         let mut names = evidence_tools.to_vec();
         if inputs.page_evidence_is_current && inputs.page_evidence_revision.is_some() {
@@ -629,11 +618,7 @@ fn validate_source_screening_tool_page(
 fn is_semantic_review_tool(name: &str) -> bool {
     matches!(
         name,
-        "inspect_source_evidence"
-            | "view_page_source_debug"
-            | "review_page_translation"
-            | "view_page_debug"
-            | "submit_visual_semantic_review"
+        "inspect_page_evidence" | "submit_visual_semantic_review"
     )
 }
 
@@ -2328,9 +2313,9 @@ impl HarnessHost {
         let next_action = if export_precondition_satisfied {
             "export_pages after deterministic acceptance"
         } else if review.rejected() {
-            "repair the concrete issues, refresh all four evidence artifacts, then run review_pages again"
+            "repair the concrete issues, refresh bundled page evidence, then run review_pages again"
         } else {
-            "repeat the four-artifact evidence workflow and submit_visual_semantic_review for each remaining page"
+            "inspect_page_evidence and submit_visual_semantic_review for each remaining page"
         };
         Invocation::read(json!({
             "agent_review": submitted,
@@ -2338,6 +2323,130 @@ impl HarnessHost {
             "export_precondition_satisfied": export_precondition_satisfied,
             "next_action": next_action,
         }))
+    }
+
+    async fn inspect_page_evidence(&self, call: &ToolCall) -> Result<Invocation> {
+        if !self.pipeline_completed() {
+            bail!("the complete Koharu pipeline must finish before page evidence inspection");
+        }
+        let arguments: InspectPageEvidence = arguments(call)?;
+        let snapshot = self.project.session().lock().await.snapshot();
+        let page = resolve_page_ordinal(&snapshot, arguments.page_ordinal)?;
+        let revision = snapshot.revision();
+        let evidence_before = self.page_semantic_evidence.lock().clone();
+        let current_page_before = *self.current_semantic_evidence_page.lock();
+        let observation_before = self.last_explicit_observation.lock().clone();
+        let trace_count_before = self.trace_records.lock().len();
+        let artifact_call = |suffix: &str, name: &str| ToolCall {
+            call_id: format!("{}-{suffix}", call.call_id),
+            name: name.to_owned(),
+            arguments: json!({ "page_ordinal": arguments.page_ordinal.get() }).to_string(),
+        };
+
+        let bundled = async {
+            let source = self
+                .inspect_source_evidence(&artifact_call("source", "inspect_source_evidence"))
+                .await?;
+            let source_debug = self
+                .view_page_source_debug(&artifact_call("source-debug", "view_page_source_debug"))
+                .await?;
+            let translated = self
+                .review_page_translation(&artifact_call("translated", "review_page_translation"))
+                .await?;
+            let rendered_debug = self
+                .view_page_debug(&artifact_call("rendered-debug", "view_page_debug"))
+                .await?;
+
+            let source_evidence = source
+                .value
+                .get("source_evidence")
+                .cloned()
+                .context("source evidence inspection omitted its dossier")?;
+            let source_evidence_dossier_blake3 = source
+                .value
+                .get("source_evidence_dossier_blake3")
+                .and_then(Value::as_str)
+                .context("source evidence inspection omitted its dossier digest")?
+                .to_owned();
+            let source_debug_artifact_blake3 = source_debug
+                .value
+                .get("blake3")
+                .and_then(Value::as_str)
+                .context("source debug inspection omitted its artifact digest")?
+                .to_owned();
+            let dossier_blake3 = translated
+                .value
+                .get("dossier_blake3")
+                .and_then(Value::as_str)
+                .context("translated dossier inspection omitted its digest")?
+                .to_owned();
+            let debug_artifact_blake3 = rendered_debug
+                .value
+                .get("blake3")
+                .and_then(Value::as_str)
+                .context("rendered debug inspection omitted its artifact digest")?
+                .to_owned();
+            let mut translated_dossier = translated
+                .value
+                .get("dossier")
+                .cloned()
+                .context("translated dossier inspection omitted its dossier")?;
+            translated_dossier
+                .as_object_mut()
+                .context("translated dossier must be an object")?
+                .insert(
+                    "accepted_predecessor_context".to_owned(),
+                    translated
+                        .value
+                        .get("accepted_predecessor_context")
+                        .cloned()
+                        .context("translated dossier omitted predecessor context")?,
+                );
+
+            ensure!(
+                complete_page_evidence(&self.page_semantic_evidence.lock(), page.id)
+                    == Some((revision, page.id)),
+                "bundled page evidence did not bind one exact page revision"
+            );
+            *self.last_explicit_observation.lock() =
+                Some(RevisionEvidence::PageTranslationVisualEvidence {
+                    revision,
+                    page_id: page.id,
+                    source_evidence_dossier_blake3: source_evidence_dossier_blake3.clone(),
+                    source_debug_artifact_blake3: source_debug_artifact_blake3.clone(),
+                    dossier_blake3: dossier_blake3.clone(),
+                    debug_artifact_blake3: debug_artifact_blake3.clone(),
+                });
+
+            let mut invocation = Invocation::read(json!({
+                "page_ordinal": page.ordinal.get(),
+                "page_id": page.id,
+                "scene_revision": revision,
+                "source_evidence": source_evidence,
+                "source_debug_artifact": source_debug.value,
+                "translated_dossier": translated_dossier,
+                "rendered_debug_artifact": rendered_debug.value,
+                "source_evidence_dossier_blake3": source_evidence_dossier_blake3,
+                "source_debug_artifact_blake3": source_debug_artifact_blake3,
+                "dossier_blake3": dossier_blake3,
+                "debug_artifact_blake3": debug_artifact_blake3,
+                "next_action": "submit_visual_semantic_review",
+            }))?;
+            invocation.images = source.images;
+            invocation.images.extend(source_debug.images);
+            invocation.images.extend(translated.images);
+            invocation.images.extend(rendered_debug.images);
+            Ok(invocation)
+        }
+        .await;
+
+        if bundled.is_err() {
+            *self.page_semantic_evidence.lock() = evidence_before;
+            *self.current_semantic_evidence_page.lock() = current_page_before;
+            *self.last_explicit_observation.lock() = observation_before;
+            self.trace_records.lock().truncate(trace_count_before);
+        }
+        bundled
     }
 
     async fn review_page_translation(&self, call: &ToolCall) -> Result<Invocation> {
@@ -5667,8 +5776,7 @@ impl Host for HarnessHost {
             }
             "classify_decorative_sfx" => self.classify_decorative_sfx(&call).await,
             "verify_ui_panel_anchor" => self.verify_ui_panel_anchor(&call).await,
-            "review_page_translation" => self.review_page_translation(&call).await,
-            "view_page_debug" => self.view_page_debug(&call).await,
+            "inspect_page_evidence" => self.inspect_page_evidence(&call).await,
             "run_pipeline" => {
                 let _: RunPipeline = arguments(&call)?;
                 self.run_pipeline(control).await
@@ -5996,7 +6104,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             ),
             definition::<InspectSourceEvidence>(
                 "inspect_source_evidence",
-                "After source analysis, start page-context review with authoritative original pixels. Writes a read-only page-scoped dossier and stable full-page/original-crop artifacts for every ordinal, including text role, required versus skipped_difficult_sfx state, verified UI-panel evidence, and after translation every adjacent free-dialogue assessment/decision with exact role/writing gates, source/candidate bounds, distance/direction, pixel/edge/boundary/background/contrast/room/association measurements, deterministic score, all rejected candidates, and any narrow source-bound native-vertical preview eligibility. Original pixels are authoritative and OCR is fallible. Before translation, pair this with view_page_source_debug; after translation, refresh it as part of the four-artifact review sequence.",
+                "After source analysis, inspect authoritative original pixels for source screening. Writes a read-only page-scoped dossier and stable full-page/original-crop artifacts for every ordinal, including text role, required versus skipped_difficult_sfx state, verified UI-panel evidence, source/candidate bounds, and source-raster measurements. Original pixels are authoritative and OCR is fallible. Pair this source-screening API with view_page_source_debug before translation.",
             ),
             definition::<ViewPageSourceDebug>(
                 "view_page_source_debug",
@@ -6010,13 +6118,9 @@ fn tool_definitions() -> &'static Vec<Tool> {
                 "verify_ui_panel_anchor",
                 "Before translation, positively classify required detector-backed free text as UI and bind it to one explicit source-raster-verified panel/screen candidate from the current source dossier/debug overlay. The exact ordinal, source crop, debug label, existing panel region ID, UI role/function, visible finite screen evidence, source-to-panel relation, text-safe interior, detection/visual provenance, confidence >= 0.90, and reason are required in addition to the immutable closed-contour, distinct-interior, safe-room, source-containment, and detector/version record. Model-only panels, dialogue, SFX, captions/general free text, weak association, non-contained source text, inferred geometry, and nearest-panel selection are rejected. Verification records evidence only; target placement remains source-bound until an exact preview_text_layout candidate succeeds and is committed.",
             ),
-            definition::<ReviewPageTranslation>(
-                "review_page_translation",
-                "After inspecting original source evidence, read one complete translated page as a deterministic dialogue dossier. Returns every relevant text element in explicit top-to-bottom/right-to-left order with linkable ordinal and collision-aware concise stable element ID, original/current OCR, current translation and languages, geometry summaries, typography, rendered line/bounds/clearance metrics, adjacency, page-wide continuity/register/parentheses prompts, and rendered-page digests. This is evidence, not a claim of semantic correctness. Required review order: inspect_source_evidence + view_page_source_debug -> review_page_translation + view_page_debug -> review_pages -> submit_visual_semantic_review when no command judge is configured.",
-            ),
-            definition::<ViewPageDebug>(
-                "view_page_debug",
-                "After inspecting original source evidence, render a headless read-only translated-page overlay into run review scratch. Labels every dossier element with its reading-order ordinal and a deterministic collision-aware concise ID that is unique within the page revision; red marks source region polygons, blue layout bounds, and green rendered text bounds. Returns the PNG artifact path/media/hash metadata and image without changing project or export state. Required review order: inspect_source_evidence + view_page_source_debug -> review_page_translation + view_page_debug -> review_pages -> submit_visual_semantic_review when no command judge is configured.",
+            definition::<InspectPageEvidence>(
+                "inspect_page_evidence",
+                "Atomically produce the source dossier/debug and translated dossier/debug artifacts for one exact translated page ordinal. Return and bind all four exact current-revision BLAKE3 digests for direct semantic submission, with accepted earlier pages as read-only context.",
             ),
             definition::<RunPipeline>(
                 "run_pipeline",
@@ -6024,11 +6128,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
             ),
             definition::<ReviewPages>(
                 "review_pages",
-                "After inspect_source_evidence + view_page_source_debug -> review_page_translation + view_page_debug, create the current-revision review bundle containing each actual original page, translated rendered preview, all semantic source elements (including skipped_difficult_sfx), and deterministic acceptance. Host-recorded exact target migrations are previewed, globally validated, committed, and deterministically re-reviewed only when a blocking page-level safety failure authorizes them; diagnostic font, glyph, anchor, and contour measurements never trigger repair. A failed host candidate records and surfaces a terminal diagnostic without mutation. Semantic wording revision remains model-facing. With a configured command judge, preserve its independent decision. Without one, return pending_agent_review; then submit_visual_semantic_review for the same page/revision and exact four evidence digests. No semantic decision overrides deterministic export gates.",
+                "After inspect_page_evidence, create the current-revision review bundle containing each actual original page, translated rendered preview, all semantic source elements (including skipped_difficult_sfx), and deterministic acceptance. Host-recorded exact target migrations are previewed, globally validated, committed, and deterministically re-reviewed only when a blocking page-level safety failure authorizes them; diagnostic font, glyph, anchor, and contour measurements never trigger repair. A failed host candidate records and surfaces a terminal diagnostic without mutation. Semantic wording revision remains model-facing. With a configured command judge, preserve its independent decision. Without one, return pending_agent_review; then inspect_page_evidence and submit_visual_semantic_review for each exact page/revision. No semantic decision overrides deterministic export gates.",
             ),
             definition::<SubmitVisualSemanticReview>(
                 "submit_visual_semantic_review",
-                "Submit one narrow structured page judgment only after inspect_source_evidence + view_page_source_debug -> review_page_translation + view_page_debug -> review_pages. Bind the exact current scene_revision and all four returned BLAKE3 digests for that same page. Compare the authoritative original full page/crops and source-debug overlay with the translated dossier/render/debug overlay; explicitly judge source pixels, translated meaning, target-language naturalness, reading order, omissions/duplicates, typography/layout, and whether every skipped item is truly difficult decorative SFX with no required content skipped. For every committed compact translation, compacted_translation_reviews must bind every ordered original group-member crop and explicitly judge meaning fidelity and natural Korean; drift must be reported in both compact and page issues and blocks export. Use an empty list when there was no compaction. Never infer semantic or visual acceptance from deterministic geometry. accepted=true requires all seven booleans true, an issue-free nonempty summary, and fresh matching evidence. Rejection requires concrete retained issues and blocks export. This tool cannot replace or bypass a configured command judge.",
+                "Submit one narrow structured page judgment only after inspect_page_evidence for the exact current semantic-review obligation. Bind the exact current scene_revision and all four bundled BLAKE3 digests for that same page. Compare the authoritative original full page/crops and source-debug overlay with the translated dossier/render/debug overlay; explicitly judge source pixels, translated meaning, target-language naturalness, reading order, omissions/duplicates, typography/layout, and whether every skipped item is truly difficult decorative SFX with no required content skipped. For every committed compact translation, compacted_translation_reviews must bind every ordered original group-member crop and explicitly judge meaning fidelity and natural Korean; drift must be reported in both compact and page issues and blocks export. Use an empty list when there was no compaction. Never infer semantic or visual acceptance from deterministic geometry. accepted=true requires all seven booleans true, an issue-free nonempty summary, and fresh matching evidence. Rejection requires concrete retained issues and blocks export. This tool cannot replace or bypass a configured command judge.",
             ),
             definition::<ReviseElement>(
                 "revise_element",
@@ -6036,7 +6140,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             ),
             definition::<RevisePageTranslation>(
                 "revise_page_translation",
-                "Atomically revise page-level source/translation semantics only after the exact current page revision has all four fresh matching evidence parts in this order: inspect_source_evidence + view_page_source_debug -> review_page_translation + view_page_debug -> revise_page_translation. Evidence must include that revision and all four returned BLAKE3 digests. Original crop pixels, not fallible OCR text alone, are authoritative for any source correction. Each strict entry names one element plus nonempty language-tagged source and/or target translation; all targets must belong to the page. Geometry, source-region ownership, opacity, padding, typography, and layout fields are not accepted. All four evidence artifacts' page/revision/digest provenance and first OCR are retained. Before initial review_pages, the four-part set authorizes a semantic batch. Once review_pages produces a deterministic plan, its first failure remains binding: only its allowed semantic field may be edited, and any layout/clearance plan blocks this tool. Accepted or failed visual/semantic review is never repair evidence.",
+                "Atomically revise page-level source/translation semantics only after inspect_page_evidence has produced all four fresh matching evidence artifacts for the exact current page revision. Evidence must include that revision and all four returned BLAKE3 digests. Original crop pixels, not fallible OCR text alone, are authoritative for any source correction. Each strict entry names one element plus nonempty language-tagged source and/or target translation; all targets must belong to the page. Geometry, source-region ownership, opacity, padding, typography, and layout fields are not accepted. All four evidence artifacts' page/revision/digest provenance and first OCR are retained. Before initial review_pages, the four-part set authorizes a semantic batch. Once review_pages produces a deterministic plan, its first failure remains binding: only its allowed semantic field may be edited, and any layout/clearance plan blocks this tool. Accepted or failed visual/semantic review is never repair evidence.",
             ),
             definition::<PreviewTextLayout>(
                 "preview_text_layout",
@@ -6130,11 +6234,8 @@ fn compact_tool_description(name: &str) -> &'static str {
         "verify_ui_panel_anchor" => {
             "On the page selected by its 1-based position in project.pages, bind required UI text to one listed detector-backed finite panel using exact fresh source evidence, containment, UI role, safe interior, provenance, confidence >= 0.90, and reason; inferred/nearest geometry is forbidden."
         }
-        "review_page_translation" => {
-            "For the page selected by its 1-based position in project.pages, read the complete ordered translated-page dossier with source/target semantics, geometry, typography, render metrics, and digests."
-        }
-        "view_page_debug" => {
-            "For the page selected by its 1-based position in project.pages, render the read-only translated overlay with stable element IDs and source/layout/glyph bounds."
+        "inspect_page_evidence" => {
+            "For the page selected by its 1-based position in project.pages, return the bundled source dossier/debug and translated dossier/debug artifacts with four exact current-revision digests."
         }
         "run_pipeline" => {
             "Translate and inpaint every required item after source review; only recorded difficult SFX are excluded."
@@ -6367,27 +6468,13 @@ fn semantic_review_obligation(
             ),
             id: page_id,
         };
-        let page_evidence = evidence.page(page_id);
-        let artifact_is_current = |artifact: Option<&PageEvidenceArtifact>| {
-            artifact.is_some_and(|artifact| {
-                artifact.page_id == page_id && artifact.revision == snapshot.revision()
-            })
-        };
         let required_stage =
-            if !artifact_is_current(page_evidence.and_then(|page| page.source_dossier.as_ref())) {
-                SemanticReviewStage::InspectSourceEvidence
-            } else if !artifact_is_current(
-                page_evidence.and_then(|page| page.source_debug_artifact.as_ref()),
-            ) {
-                SemanticReviewStage::ViewPageSourceDebug
-            } else if !artifact_is_current(page_evidence.and_then(|page| page.dossier.as_ref())) {
-                SemanticReviewStage::ReviewPageTranslation
-            } else if !artifact_is_current(
-                page_evidence.and_then(|page| page.debug_artifact.as_ref()),
-            ) {
-                SemanticReviewStage::ViewPageDebug
-            } else {
+            if complete_page_evidence(evidence, page_id).is_some_and(|(revision, evidence_page)| {
+                revision == snapshot.revision() && evidence_page == page_id
+            }) {
                 SemanticReviewStage::SubmitVisualSemanticReview
+            } else {
+                SemanticReviewStage::InspectPageEvidence
             };
         return Ok(Some(SemanticReviewObligation {
             page: target,
@@ -7046,19 +7133,19 @@ fn validate_four_part_page_evidence(
     let source_dossier = observations
         .source_dossier
         .as_ref()
-        .with_context(|| format!("{action} requires fresh inspect_source_evidence evidence"))?;
+        .with_context(|| format!("{action} requires fresh bundled source dossier evidence"))?;
     let source_debug = observations
         .source_debug_artifact
         .as_ref()
-        .with_context(|| format!("{action} requires fresh view_page_source_debug evidence"))?;
+        .with_context(|| format!("{action} requires fresh bundled source debug evidence"))?;
     let dossier = observations
         .dossier
         .as_ref()
-        .with_context(|| format!("{action} requires fresh review_page_translation evidence"))?;
+        .with_context(|| format!("{action} requires fresh bundled translated dossier evidence"))?;
     let debug = observations
         .debug_artifact
         .as_ref()
-        .with_context(|| format!("{action} requires fresh view_page_debug evidence"))?;
+        .with_context(|| format!("{action} requires fresh bundled rendered debug evidence"))?;
     for (name, evidence) in [
         ("source evidence dossier", source_dossier),
         ("source debug artifact", source_debug),
@@ -9815,6 +9902,12 @@ struct ViewPage {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct InspectPageEvidence {
+    page_ordinal: PageOrdinal,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReviewPageTranslation {
     page_ordinal: PageOrdinal,
 }
@@ -10433,7 +10526,7 @@ mod tests {
     #[test]
     fn compacted_render_review_evidence_retains_text_references_only() {
         assert_compacted_media_evidence(
-            "view_page_debug",
+            "inspect_page_evidence",
             &[("/review/render/translated-overlay.png", "image/png")],
         );
     }
@@ -10482,8 +10575,7 @@ mod tests {
                 "view_page_source_debug",
                 "classify_decorative_sfx",
                 "verify_ui_panel_anchor",
-                "review_page_translation",
-                "view_page_debug",
+                "inspect_page_evidence",
                 "run_pipeline",
                 "review_pages",
                 "submit_visual_semantic_review",
@@ -10508,8 +10600,7 @@ mod tests {
             "view_page_source_debug",
             "classify_decorative_sfx",
             "verify_ui_panel_anchor",
-            "review_page_translation",
-            "view_page_debug",
+            "inspect_page_evidence",
             "submit_visual_semantic_review",
             "revise_page_translation",
         ] {
@@ -10657,7 +10748,7 @@ mod tests {
         let (phase, exposed) = names(&inputs);
         assert_eq!(phase, WorkflowPhase::DeterministicReview);
         assert!(!exposed.contains(&"inspect_project"));
-        assert!(exposed.contains(&"review_page_translation"));
+        assert!(exposed.contains(&"inspect_page_evidence"));
         assert!(exposed.contains(&"review_pages"));
         assert!(!exposed.contains(&"revise_page_translation"));
 
@@ -10711,7 +10802,7 @@ mod tests {
         assert!(exposed.contains(&"submit_visual_semantic_review"));
 
         inputs.current_page_review_accepted = Some(true);
-        inputs.semantic_review_stage = Some(SemanticReviewStage::InspectSourceEvidence);
+        inputs.semantic_review_stage = Some(SemanticReviewStage::InspectPageEvidence);
         let (phase, exposed) = names(&inputs);
         assert_eq!(phase, WorkflowPhase::PageEvidence);
         assert!(!exposed.contains(&"submit_visual_semantic_review"));
@@ -13487,57 +13578,81 @@ mod tests {
             page_id: EntityId,
             predecessor: Option<EntityId>,
         ) -> [String; 4] {
-            let mut digests = Vec::new();
-            for (index, (tool_name, next_stage)) in [
-                ("inspect_source_evidence", "view_page_source_debug"),
-                ("view_page_source_debug", "review_page_translation"),
-                ("review_page_translation", "view_page_debug"),
-                ("view_page_debug", "submit_visual_semantic_review"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                assert_obligation_tool(host, tool_name, page_ordinal, page_id, tool_name);
-                let result = host
-                    .invoke(
-                        ToolCall {
-                            call_id: format!("page-{page_ordinal}-{tool_name}"),
-                            name: tool_name.to_owned(),
-                            arguments: json!({ "page_ordinal": page_ordinal }).to_string(),
-                        },
-                        &Control::default(),
-                    )
-                    .await
-                    .unwrap();
-                assert_next_obligation(&result, page_ordinal, page_id, next_stage);
-                let digest = match index {
-                    0 => &result.value["source_evidence_dossier_blake3"],
-                    2 => &result.value["dossier_blake3"],
-                    _ => &result.value["blake3"],
-                };
-                digests.push(digest.as_str().unwrap().to_owned());
-                if let Some(predecessor) = predecessor
-                    && tool_name == "review_page_translation"
-                {
-                    assert_eq!(
-                        result.value["accepted_predecessor_context"][0]["page_id"],
-                        predecessor.to_string()
-                    );
-                    assert_eq!(
-                        result.value["accepted_predecessor_context"][0]["page_ordinal"],
-                        1
-                    );
-                    assert_eq!(
-                        result.value["accepted_predecessor_context"][0]["review_accepted"],
-                        true
-                    );
-                    assert!(
-                        result.value["accepted_predecessor_context"][0]["source_translation_pairs"]
-                            .is_array()
-                    );
-                }
+            assert_obligation_tool(
+                host,
+                "inspect_page_evidence",
+                page_ordinal,
+                page_id,
+                "inspect_page_evidence",
+            );
+            let evidence_before_submit = host.page_semantic_evidence.lock().clone();
+            let premature_submit = host
+                .invoke(
+                    ToolCall {
+                        call_id: format!("premature-submit-page-{page_ordinal}"),
+                        name: "submit_visual_semantic_review".to_owned(),
+                        arguments: json!({ "page_ordinal": page_ordinal }).to_string(),
+                    },
+                    &Control::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                premature_submit
+                    .to_string()
+                    .contains("submit_visual_semantic_review")
+            );
+            assert_eq!(*host.page_semantic_evidence.lock(), evidence_before_submit);
+
+            let result = host
+                .invoke(
+                    ToolCall {
+                        call_id: format!("page-{page_ordinal}-evidence"),
+                        name: "inspect_page_evidence".to_owned(),
+                        arguments: json!({ "page_ordinal": page_ordinal }).to_string(),
+                    },
+                    &Control::default(),
+                )
+                .await
+                .unwrap();
+            assert_next_obligation(
+                &result,
+                page_ordinal,
+                page_id,
+                "submit_visual_semantic_review",
+            );
+            for artifact in [
+                "source_evidence",
+                "source_debug_artifact",
+                "translated_dossier",
+                "rendered_debug_artifact",
+            ] {
+                assert!(result.value[artifact].is_object(), "missing {artifact}");
             }
-            digests.try_into().unwrap()
+            if let Some(predecessor) = predecessor {
+                assert_eq!(
+                    result.value["translated_dossier"]["accepted_predecessor_context"][0]["page_id"],
+                    predecessor.to_string()
+                );
+                assert_eq!(
+                    result.value["translated_dossier"]["accepted_predecessor_context"][0]["page_ordinal"],
+                    1
+                );
+                assert_eq!(
+                    result.value["translated_dossier"]["accepted_predecessor_context"][0]["review_accepted"],
+                    true
+                );
+                assert!(result.value["translated_dossier"]["accepted_predecessor_context"][0]
+                    ["source_translation_pairs"]
+                    .is_array());
+            }
+            [
+                "source_evidence_dossier_blake3",
+                "source_debug_artifact_blake3",
+                "dossier_blake3",
+                "debug_artifact_blake3",
+            ]
+            .map(|field| result.value[field].as_str().unwrap().to_owned())
         }
 
         async fn accept_page(
@@ -13593,26 +13708,21 @@ mod tests {
         let page_one_digests = evidence_for(&host, 1, page_ids[0], None).await;
         let accepted_page_one =
             accept_page(&host, 1, page_ids[0], revision, &page_one_digests).await;
-        assert_next_obligation(
-            &accepted_page_one,
-            2,
-            page_ids[1],
-            "inspect_source_evidence",
-        );
+        assert_next_obligation(&accepted_page_one, 2, page_ids[1], "inspect_page_evidence");
 
         assert_obligation_tool(
             &host,
-            "inspect_source_evidence",
+            "inspect_page_evidence",
             2,
             page_ids[1],
-            "inspect_source_evidence",
+            "inspect_page_evidence",
         );
         let evidence_before_wrong_page = host.page_semantic_evidence.lock().clone();
         let wrong_page = host
             .invoke(
                 ToolCall {
                     call_id: "wrong-page-source".to_owned(),
-                    name: "inspect_source_evidence".to_owned(),
+                    name: "inspect_page_evidence".to_owned(),
                     arguments: json!({ "page_ordinal": 1 }).to_string(),
                 },
                 &Control::default(),
@@ -13620,7 +13730,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(wrong_page.to_string().contains(&format!(
-            "page ordinal 2, page ID {}, required stage inspect_source_evidence",
+            "page ordinal 2, page ID {}, required stage inspect_page_evidence",
             page_ids[1]
         )));
         assert_eq!(
@@ -13636,15 +13746,15 @@ mod tests {
                 progress_marker,
             } => {
                 assert_eq!(phase, "page_evidence");
-                assert_eq!(exposed_tools, ["inspect_source_evidence"]);
+                assert_eq!(exposed_tools, ["inspect_page_evidence"]);
                 assert!(reason.contains(&format!(
-                    "page ordinal 2, page ID {}, required stage inspect_source_evidence",
+                    "page ordinal 2, page ID {}, required stage inspect_page_evidence",
                     page_ids[1]
                 )));
                 let marker: Value = serde_json::from_str(&progress_marker).unwrap();
                 assert_eq!(marker["page_ordinal"], 2);
                 assert_eq!(marker["page_id"], page_ids[1].to_string());
-                assert_eq!(marker["required_stage"], "inspect_source_evidence");
+                assert_eq!(marker["required_stage"], "inspect_page_evidence");
             }
             HostCompletion::Completed => panic!("pending page review must continue"),
         }

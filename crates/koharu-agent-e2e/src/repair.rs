@@ -473,7 +473,7 @@ fn text_layout_next_action(
     source_bound_interjection_fallback: bool,
 ) -> RepairNextAction {
     let mut constraints = vec![
-        "review_page_translation and view_page_debug establish whole-page evidence before layout repair",
+        "inspect_page_evidence establishes bundled whole-page evidence before layout repair",
         "the failure's named page-level or visible-layout safety condition governs the repair",
         "raw bounds and replacement wording are not accepted; use only controlled preview_text_layout options",
         "preview must preserve semantic ownership, source identity, and any explicitly committed target relation",
